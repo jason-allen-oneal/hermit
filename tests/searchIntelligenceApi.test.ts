@@ -284,6 +284,28 @@ describe("ClawHub weekly search intelligence receiver", () => {
 		expect(rendered).toContain("source observed 2026-09-06T00:00Z")
 		expect(rendered).toContain("search metadata unavailable")
 	})
+	it("reports an explicit empty outcome for every catalog section", async () => {
+		const { client, posts } = setup()
+		const payload = evidencePayload()
+		for (const catalog of Object.values(payload.catalogs)) {
+			catalog.recommendations = []
+			catalog.companyOpportunities = []
+			catalog.officialGaps = []
+			catalog.movers = []
+		}
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = JSON.stringify(posts[0].body)
+		for (const section of [
+			"recommendations",
+			"company opportunities",
+			"official gaps",
+			"movers"
+		])
+			expect(rendered.split(`No qualifying ${section}.`)).toHaveLength(3)
+	})
 	it("preserves a frozen legacy week and rejects replacing its receipt with a v2 report", async () => {
 		const { client, posts } = setup()
 		expect(

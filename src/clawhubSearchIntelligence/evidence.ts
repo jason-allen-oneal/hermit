@@ -426,7 +426,12 @@ export const renderEvidenceDigest = (digest: EvidenceDigest) => {
 	const header = `### ${preview ? "LOCAL PREVIEW · " : ""}ClawHub weekly intelligence\n${time(digest.weekStart)} – ${time(digest.weekEnd)} (UTC, end exclusive)\n[Open intelligence dashboard](${link(digest.dashboardUrl)})`
 	const footer =
 		"Human quality review, security and category-coverage review remain required. Company classification is advisory. Query details require at least 3 searches; matched-query searches are separate from adoption."
-	const sections: { title: string; rows: string[]; omitted: boolean }[] = []
+	const sections: {
+		title: string
+		rows: string[]
+		empty?: string
+		omitted: boolean
+	}[] = []
 	const rowText = (row: ScopedRow) =>
 		`[${brief(row.query)}](${link(row.searchUrl)}) (${row.scope}) · ${row.searches} searches · ${row.officialGaps} gaps · previous ${row.previousSearches}`
 	for (const [name, catalog] of [
@@ -445,27 +450,41 @@ export const renderEvidenceDigest = (digest: EvidenceDigest) => {
 			rows: [],
 			omitted: false
 		})
-		for (const [title, rows] of [
+		for (const [title, rows, empty] of [
 			[
 				`${name} Featured recommendations`,
-				catalog.recommendations.map(recommendationText)
+				catalog.recommendations.map(recommendationText),
+				"No qualifying recommendations."
 			],
 			[
 				`${name} company opportunities`,
 				catalog.companyOpportunities.map(
 					(row) =>
 						`${rowText(row)}${row.companyProductName ? ` · ${brief(row.companyProductName)}` : ""} · ${Math.round(row.confidence * 100)}% classifier confidence`
-				)
+				),
+				"No qualifying company opportunities."
 			],
-			[`${name} official gaps`, catalog.officialGaps.map(rowText)],
-			[`${name} movers`, catalog.movers.map(rowText)]
+			[
+				`${name} official gaps`,
+				catalog.officialGaps.map(rowText),
+				"No qualifying official gaps."
+			],
+			[`${name} movers`, catalog.movers.map(rowText), "No qualifying movers."]
 		] as const)
-			sections.push({ title: `**${title}**`, rows: [...rows], omitted: false })
+			sections.push({
+				title: `**${title}**`,
+				rows: [...rows],
+				empty,
+				omitted: false
+			})
 	}
 	const text = (section: (typeof sections)[number]) =>
 		[
 			section.title,
 			...section.rows,
+			...(!section.rows.length && !section.omitted && section.empty
+				? [section.empty]
+				: []),
 			...(section.omitted ? ["More evidence on the dashboard."] : [])
 		].join("\n")
 	const renderedLength = () =>
