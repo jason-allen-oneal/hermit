@@ -455,6 +455,46 @@ describe("ClawHub weekly search intelligence receiver", () => {
 			expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
 	})
 
+	it.each([
+		[false, false],
+		[true, false],
+		[false, true],
+		[true, true]
+	])(
+		"shows monthly evidence limitations independently (digest %s, adoption %s)",
+		async (digestLimited, adoptionLimited) => {
+			const { client, posts } = setup()
+			const payload = monthlyPayload()
+			payload.truncated = digestLimited
+			Object.assign(payload.catalogs.plugins.adoption, {
+				totalItems: 101,
+				inspectedItems: 100,
+				truncated: adoptionLimited
+			})
+			expect(
+				(await handleSearchIntelligenceApiRequest(request(payload), client))
+					?.status
+			).toBe(200)
+			const rendered = posts.flatMap(({ body }) => texts(body)).join("\n")
+			expect(
+				rendered.includes(
+					"Some evidence details omitted; all proposed slots retained."
+				)
+			).toBe(digestLimited)
+			expect(
+				rendered.includes(
+					"Plugins adoption metadata limited; inspected 100 of 101 candidates."
+				)
+			).toBe(adoptionLimited)
+			expect(rendered).not.toContain("Skills adoption metadata limited")
+			for (const catalog of Object.values(payload.catalogs))
+				for (const row of catalog.recommendations)
+					expect(rendered).toContain(row.id)
+			for (const { body } of posts)
+				expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
+		}
+	)
+
 	it("keeps pending editorial slots, full rationales and unavailable counts distinct", async () => {
 		const { client, posts } = setup()
 		const payload = monthlyPayload()

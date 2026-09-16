@@ -212,6 +212,10 @@ export const renderMonthlyDigest = (digest: MonthlyDigest) => {
 		blocks.push(
 			`### ${name}: ${catalog.recommendations.length}/16 ready\nInstalls: 30 completed UTC days ${day(adoption.periodStart)} – ${day(adoption.periodEnd)} (end exclusive); final 7 days from ${day(adoption.periodStart7d)}. Counts below: 30d / 7d.\n${lineup.pendingCount} pending editorial; ${lineup.telemetryShortfall} telemetry shortfall. ${lineup.removals.length} proposed removals. Editorial revision ${lineup.editorialRevision}${lineup.staleEditorial ? ` is stale (current ${lineup.currentEditorialRevision}); regenerate before approval.` : "."}\nAggregate scan ${new Date(adoption.collectionStartedAt).toISOString()} – ${adoption.generatedAt === null ? "unknown" : new Date(adoption.generatedAt).toISOString()}; ${adoption.importedRows} imported rows. ${adoption.status === "unavailable" ? "Adoption unavailable." : ""}`
 		)
+		if (adoption.truncated)
+			blocks.push(
+				`${name} adoption metadata limited; inspected ${adoption.inspectedItems} of ${adoption.totalItems} candidates.`
+			)
 		for (let slot = 0; slot < 16; slot++) {
 			const candidate = catalog.recommendations.find(
 				(entry) => entry.slot === slot
@@ -277,7 +281,7 @@ export const renderMonthlyDigest = (digest: MonthlyDigest) => {
 			components: [
 				new Container([
 					new TextDisplay(
-						`### ${preview ? "LOCAL PREVIEW · " : ""}ClawHub monthly Featured review · ${index + 1}/${pages.length}\nAdvisory; approval required. Search context ${day(digest.weekStart)} – ${day(digest.weekEnd)} is separate from install ranking. Full search links and removal reasons remain on the dashboard.`
+						`### ${preview ? "LOCAL PREVIEW · " : ""}ClawHub monthly Featured review · ${index + 1}/${pages.length}\nAdvisory; approval required. Search context ${day(digest.weekStart)} – ${day(digest.weekEnd)} is separate from install ranking. Full search links and removal reasons remain on the dashboard.${digest.truncated ? "\nSome evidence details omitted; all proposed slots retained." : ""}`
 					),
 					new TextDisplay(page),
 					new Row([new DashboardLink(dashboardUrl)])
