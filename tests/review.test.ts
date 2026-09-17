@@ -1,4 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
+import { Database } from "bun:sqlite"
+import fs from "node:fs"
+import path from "node:path"
 import { Container, TextDisplay } from "@buape/carbon"
 import { contentFeatures, conversationalText } from "../src/review/features.js"
 import { timingSignals } from "../src/review/timing.js"
@@ -487,6 +490,58 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			const expiresDate = new Date(updateCaseArgs.update.expiresAt).getTime()
 			expect(expiresDate).toBeGreaterThan(Date.now() + 6 * 86400000)
 		})
+
+		it("synchronizes shared review card when decided from an ephemeral command card", async () => {
+			const confirmBot = new ReviewConfirmBotButton("case-303")
+			let patchedMessageRoute: string | null = null
+			let patchedPayload: any = null
+
+			spyOn(reviewData, "updateReviewCase").mockResolvedValue({
+				id: 3,
+				caseId: "case-303",
+				guildId: reviewConfig.guildId,
+				targetUserId: "target-bot-3",
+				status: "confirmed_bot",
+				heuristicScore: 100,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: "99.8%",
+				krillBrief: "Agent verified",
+				krillModel: "gpt-6-astra",
+				reviewMessageId: "shared-channel-msg-999",
+				reviewChannelId: reviewConfig.reviewChannelId,
+				deliveryStatus: "delivered",
+				expiresAt: null,
+				decidedById: "staff-1",
+				decisionReason: "Confirmed automated agent account.",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			})
+
+			const mockInteraction = {
+				member: { roles: [{ id: staffRoleId }] },
+				user: { id: "staff-1" },
+				userId: "staff-1",
+				message: { id: "ephemeral-command-card-111" },
+				client: {
+					rest: {
+						patch: async (route: string, options: any) => {
+							patchedMessageRoute = route
+							patchedPayload = options.body
+							return {}
+						}
+					}
+				},
+				update: async () => {}
+			} as unknown as any
+
+			await confirmBot.run(mockInteraction, { caseId: "case-303" })
+
+			expect(patchedMessageRoute).toContain("shared-channel-msg-999")
+			expect(patchedPayload).toBeDefined()
+			expect(patchedPayload.components[0].components.length).toBeGreaterThan(0)
+		})
 	})
 
 	describe("Review Command (review.ts)", () => {
@@ -616,22 +671,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			expect(postCalled).toBe(false)
 		})
 
-		it("claims delivery atomically and marks deliveryStatus=failed on error", async () => {
+		it("claims delivery atomically and marks deliveryStatus=uncertain on network error", async () => {
 			let updatedStatus: string | null = null
-
-			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(true)
-			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-				if (update.deliveryStatus) updatedStatus = update.deliveryStatus
-				return null
-			})
-
-			const mockClient = {
-				rest: {
-					post: async () => {
-						throw new Error("Discord API 500 Internal Error")
-					}
-				}
-			} as unknown as any
 
 			const validCase: ReviewCase = {
 				id: 1,
@@ -656,8 +697,179 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
+			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(validCase)
+			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
+				if (update.deliveryStatus) updatedStatus = update.deliveryStatus
+				return null
+			})
+
+			const mockClient = {
+				rest: {
+					get: async () => [],
+					post: async () => {
+						throw new Error("Discord Gateway Timeout 504")
+					}
+				}
+			} as unknown as any
+
 			await postReviewEscalationCard(mockClient, validCase, null, null)
-			expect(updatedStatus).toBe("failed")
+			expect(updatedStatus).toBe("uncertain")
+		})
+
+		it("reconciles uncertain send without duplicate POST when card exists", async () => {
+			let postCount = 0
+			let markedDelivered = false
+
+			const uncertainCase: ReviewCase = {
+				id: 1,
+				caseId: "case-uncertain-1",
+				guildId: reviewConfig.guildId,
+				targetUserId: "target-user-rec",
+				status: "escalated",
+				heuristicScore: 90,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: null,
+				krillBrief: null,
+				krillModel: null,
+				reviewMessageId: null,
+				reviewChannelId: reviewConfig.reviewChannelId,
+				deliveryStatus: "uncertain",
+				expiresAt: null,
+				decidedById: null,
+				decisionReason: null,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
+			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
+				if (update.deliveryStatus === "delivered" && update.reviewMessageId === "existing-card-123") {
+					markedDelivered = true
+				}
+				return null
+			})
+
+			const mockClient = {
+				rest: {
+					get: async () => [
+						{
+							id: "existing-card-123",
+							author: { bot: true },
+							components: [{ content: "🦞 Claw & Order | Automation Review\ntarget-user-rec" }]
+						}
+					],
+					post: async () => {
+						postCount++
+						return { id: "new-card-456" }
+					}
+				}
+			} as unknown as any
+
+			await postReviewEscalationCard(mockClient, uncertainCase, null, null)
+			expect(markedDelivered).toBe(true)
+			expect(postCount).toBe(0) // Reconciled read-only without duplicate POST
+		})
+
+		it("aborts delivery immediately if case is no longer escalated", async () => {
+			let postCalled = false
+			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(null)
+
+			const mockClient = {
+				rest: {
+					post: async () => {
+						postCalled = true
+						return { id: "should-not-post" }
+					}
+				}
+			} as unknown as any
+
+			const dismissedCase: ReviewCase = {
+				id: 5,
+				caseId: "case-dismissed",
+				guildId: reviewConfig.guildId,
+				targetUserId: "u1",
+				status: "dismissed",
+				heuristicScore: 50,
+				concordance: "Low",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: null,
+				krillBrief: null,
+				krillModel: null,
+				reviewMessageId: null,
+				reviewChannelId: null,
+				deliveryStatus: "pending",
+				expiresAt: null,
+				decidedById: "staff-1",
+				decisionReason: "Marked human",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			await postReviewEscalationCard(mockClient, dismissedCase, null, null)
+			expect(postCalled).toBe(false)
+		})
+	})
+
+	describe("Database Upgrade & Migration Compatibility", () => {
+		it("upgrades a populated existing database from 0012 to 0013 without data loss", () => {
+			const db = new Database(":memory:")
+
+			// Read and apply migrations 0000 through 0012
+			const drizzleDir = path.join(__dirname, "../drizzle")
+			const files = fs
+				.readdirSync(drizzleDir)
+				.filter((f) => f.endsWith(".sql"))
+				.sort()
+			const priorMigrations = files.filter((f) => f < "0013")
+			const migration13 = files.find((f) => f.startsWith("0013"))!
+
+			for (const file of priorMigrations) {
+				const sql = fs.readFileSync(path.join(drizzleDir, file), "utf-8")
+				const statements = sql.split("--> statement-breakpoint")
+				for (const stmt of statements) {
+					const clean = stmt.trim()
+					if (clean) db.run(clean)
+				}
+			}
+
+			// Insert sample rows into existing tables
+			db.run(
+				"INSERT INTO keyValue (key, value, createdAt, updatedAt) VALUES ('test-key', 'test-value', 1000, 1000)"
+			)
+
+			// Apply 0013_reflective_rictor.sql
+			const migration13Sql = fs.readFileSync(
+				path.join(drizzleDir, migration13),
+				"utf-8"
+			)
+			const statements13 = migration13Sql.split("--> statement-breakpoint")
+			for (const stmt of statements13) {
+				const clean = stmt.trim()
+				if (clean) db.run(clean)
+			}
+
+			// Verify existing data is preserved
+			const kv = db
+				.query("SELECT * FROM keyValue WHERE key = 'test-key'")
+				.get() as any
+			expect(kv).toBeDefined()
+			expect(kv.value).toBe("test-value")
+
+			// Verify new tables are ready and operational
+			db.run(
+				"INSERT INTO review_cases (case_id, guild_id, target_user_id, status, heuristic_score, concordance, behavioral_families) VALUES ('c1', 'g1', 'u1', 'open', 50, 'High', '[]')"
+			)
+			const reviewCase = db
+				.query("SELECT * FROM review_cases WHERE case_id = 'c1'")
+				.get() as any
+			expect(reviewCase).toBeDefined()
+			expect(reviewCase.status).toBe("open")
+			expect(reviewCase.delivery_status).toBe("pending")
+
+			db.close()
 		})
 	})
 })

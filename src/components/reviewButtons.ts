@@ -2,10 +2,13 @@ import {
 	Button,
 	type ButtonInteraction,
 	ButtonStyle,
+	type Client,
 	type ComponentData,
 	Container,
+	Routes,
 	Row,
 	Separator,
+	serializePayload,
 	TextDisplay
 } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
@@ -47,7 +50,7 @@ export const buildReviewCardContainer = (
 		new TextDisplay(
 			`**Heuristic Score:** ${reviewCase.heuristicScore}/100\n` +
 				`**Signal Concordance:** ${reviewCase.concordance} (${reviewCase.behavioralFamilies})\n` +
-				`**Krill Calibrated Probability:** ${reviewCase.krillProbability || "Not evaluated"}\n` +
+				`**Krill Assessment Probability (Model Estimate):** ${reviewCase.krillProbability || "Not evaluated"}\n` +
 				`**Model:** ${reviewCase.krillModel || "N/A"}`
 		)
 	]
@@ -104,6 +107,32 @@ const buildPermissionDeniedContainer = () =>
 		{ accentColor: "#f85149" }
 	)
 
+export const syncSharedReviewCard = async (
+	client: Client,
+	reviewCase: ReviewCase
+) => {
+	if (!reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
+		return
+	}
+	try {
+		const container = buildReviewCardContainer(reviewCase, null, null, true)
+		await client.rest.patch(
+			Routes.channelMessage(
+				reviewCase.reviewChannelId,
+				reviewCase.reviewMessageId
+			),
+			{
+				body: serializePayload({
+					components: [container],
+					allowedMentions: { parse: [] }
+				})
+			}
+		)
+	} catch (error) {
+		console.warn("Failed to synchronize shared review card:", error)
+	}
+}
+
 export class ReviewDismissButton extends Button {
 	customId = "review-dismiss"
 	label = "Dismiss (Human)"
@@ -142,6 +171,9 @@ export class ReviewDismissButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
+			if (interaction.message?.id !== updated.reviewMessageId) {
+				await syncSharedReviewCard(interaction.client, updated)
+			}
 		}
 	}
 }
@@ -185,6 +217,9 @@ export class ReviewWatchlistButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
+			if (interaction.message?.id !== updated.reviewMessageId) {
+				await syncSharedReviewCard(interaction.client, updated)
+			}
 		}
 	}
 }
@@ -227,6 +262,9 @@ export class ReviewConfirmBotButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
+			if (interaction.message?.id !== updated.reviewMessageId) {
+				await syncSharedReviewCard(interaction.client, updated)
+			}
 		}
 	}
 }

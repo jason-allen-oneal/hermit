@@ -216,6 +216,7 @@ declare global {
 			CLAWHUB_NOREPLY_FROM?: string;
 			CLAWHUB_HERMIT_TOKEN?: string;
 			CLAWHUB_SITE_URL?: string;
+			DISCRAWL_EXPORT_PATH?: string;
 		}
 	}
 }

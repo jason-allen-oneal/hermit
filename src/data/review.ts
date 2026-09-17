@@ -9,6 +9,10 @@ import {
 	type ReviewObservation
 } from "../db/schema.js"
 import type { ReviewMessage } from "../review/types.js"
+import {
+	getRecentDiscrawlObservations,
+	getDiscrawlObservationCount
+} from "../services/discrawl.js"
 
 const now = sql`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
@@ -30,6 +34,17 @@ export const getRecentUserObservations = async (
 	windowDays = 7,
 	limit = 200
 ): Promise<ReviewMessage[]> => {
+	const discrawlPath = process.env.DISCRAWL_EXPORT_PATH
+	if (discrawlPath) {
+		return getRecentDiscrawlObservations(
+			discrawlPath,
+			guildId,
+			authorId,
+			windowDays,
+			limit
+		)
+	}
+
 	const cutoff = new Date(Date.now() - windowDays * 86400000).toISOString()
 
 	const rows = await getDb()
@@ -159,8 +174,10 @@ export const updateReviewCase = async (
 }
 
 export const claimReviewCaseDelivery = async (
-	caseId: string
-): Promise<boolean> => {
+	caseId: string,
+	claimTimeoutMs = 120_000
+): Promise<ReviewCase | null> => {
+	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
 	const [claimed] = await getDb()
 		.update(reviewCases)
 		.set({
@@ -170,18 +187,21 @@ export const claimReviewCaseDelivery = async (
 		.where(
 			and(
 				eq(reviewCases.caseId, caseId),
-				inArray(reviewCases.deliveryStatus, ["pending", "failed"])
+				eq(reviewCases.status, "escalated"),
+				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed', 'uncertain') OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
 			)
 		)
 		.returning()
 
-	return Boolean(claimed)
+	return claimed ?? null
 }
 
 export const getUndeliveredEscalations = async (
 	guildId: string,
-	limit = 10
+	limit = 10,
+	claimTimeoutMs = 120_000
 ): Promise<ReviewCase[]> => {
+	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
 	return getDb()
 		.select()
 		.from(reviewCases)
@@ -189,7 +209,7 @@ export const getUndeliveredEscalations = async (
 			and(
 				eq(reviewCases.guildId, guildId),
 				eq(reviewCases.status, "escalated"),
-				inArray(reviewCases.deliveryStatus, ["pending", "failed"])
+				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed', 'uncertain') OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
 			)
 		)
 		.limit(limit)
@@ -232,6 +252,11 @@ export const getUserObservationCount = async (
 	authorId: string,
 	windowDays = 7
 ): Promise<number> => {
+	const discrawlPath = process.env.DISCRAWL_EXPORT_PATH
+	if (discrawlPath) {
+		return getDiscrawlObservationCount(discrawlPath, guildId, authorId, windowDays)
+	}
+
 	const cutoff = new Date(Date.now() - windowDays * 86400000).toISOString()
 	const [result] = await getDb()
 		.select({ count: sql<number>`count(*)` })

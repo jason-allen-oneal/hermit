@@ -173,7 +173,7 @@ export default class ReviewCommand extends BaseCommand {
 				`**Member ID:** ${targetUserId} (<@${targetUserId}>)\n` +
 					`**Sample:** ${report.sample.messages} messages, ${report.sample.channels} channel(s). Span: ${(report.sample.spanMs / 3600000).toFixed(1)}h.\n` +
 					`**Heuristic score:** ${report.heuristicScore ?? 0}/100 (not a probability)\n` +
-					`**Automation probability:** ${krill ? `${(krill.automationProbability * 100).toFixed(1)}% (calibrated via Krill)` : "unavailable (not calibrated)"}\n` +
+					`**Automation probability:** ${krill ? `${(krill.automationProbability * 100).toFixed(1)}% (Krill model estimate)` : "unavailable (not evaluated)"}\n` +
 					`**Signal concordance:** ${report.concordance} (${Object.keys(report.familyScores).length} behavioral families: ${Object.keys(report.familyScores).join(", ") || "none"}).`
 			)
 		]

@@ -16,5 +16,8 @@ export const reviewConfig = {
 		timeoutMs: 15000
 	},
 	windowDays: 7,
-	maxObservationsPerSample: 100
-} as const
+	maxObservationsPerSample: 100,
+	get discrawlExportPath(): string | undefined {
+		return process.env.DISCRAWL_EXPORT_PATH
+	}
+}
