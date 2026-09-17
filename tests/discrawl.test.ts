@@ -9,6 +9,7 @@ import {
 } from "../src/services/discrawl.js"
 import { reviewConfig } from "../src/config/review.js"
 import { getRecentUserObservations, getUserObservationCount } from "../src/data/review.js"
+import { startDiscrawlServer } from "../forwarder/src/discrawlServer.js"
 
 describe("Discrawl Backend Integration", () => {
 	let tempDir: string
@@ -192,5 +193,57 @@ describe("Discrawl Backend Integration", () => {
 			7
 		)
 		expect(count).toBe(1)
+	})
+
+	it("fetches observations remotely when DISCRAWL_EXPORT_URL is configured", async () => {
+		const filePath = path.join(tempDir, "export-remote.json")
+		const now = Date.now()
+
+		const sample = [
+			{
+				id: "remote-msg-1",
+				guild_id: reviewConfig.guildId,
+				channel_id: "chan-1",
+				author: { id: "remote-user-1" },
+				content: "Remote test via forwarder HTTP server",
+				timestamp: now - 3000
+			}
+		]
+		fs.writeFileSync(filePath, JSON.stringify(sample))
+
+		const server = startDiscrawlServer({
+			exportPath: filePath,
+			secret: "test-secret-discrawl",
+			port: 39182
+		})
+
+		const prevUrl = process.env.DISCRAWL_EXPORT_URL
+		const prevSec = process.env.DISCRAWL_SECRET
+		process.env.DISCRAWL_EXPORT_URL = "http://127.0.0.1:39182"
+		process.env.DISCRAWL_SECRET = "test-secret-discrawl"
+
+		try {
+			const obs = await getRecentUserObservations(
+				reviewConfig.guildId,
+				"remote-user-1",
+				7,
+				50
+			)
+			expect(obs.length).toBe(1)
+			expect(obs[0].messageId).toBe("remote-msg-1")
+
+			const count = await getUserObservationCount(
+				reviewConfig.guildId,
+				"remote-user-1",
+				7
+			)
+			expect(count).toBe(1)
+		} finally {
+			server.stop(true)
+			if (prevUrl !== undefined) process.env.DISCRAWL_EXPORT_URL = prevUrl
+			else delete process.env.DISCRAWL_EXPORT_URL
+			if (prevSec !== undefined) process.env.DISCRAWL_SECRET = prevSec
+			else delete process.env.DISCRAWL_SECRET
+		}
 	})
 })

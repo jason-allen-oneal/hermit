@@ -49,18 +49,23 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 		const replyToId = data.message_reference?.message_id || null
 
 		try {
-			await recordObservation({
-				messageId: data.id,
-				guildId: data.guild_id,
-				channelId: data.channel_id,
-				authorId: data.author.id,
-				createdAt: data.timestamp || new Date().toISOString(),
-				replyToId,
-				contentLength: features.contentLength,
-				lineCount: features.lineCount,
-				fingerprint: features.fingerprint,
-				artifacts: JSON.stringify(features.artifacts)
-			})
+			const isExportBackend = Boolean(
+				reviewConfig.discrawlExportPath || reviewConfig.discrawlExportUrl
+			)
+			if (!isExportBackend) {
+				await recordObservation({
+					messageId: data.id,
+					guildId: data.guild_id,
+					channelId: data.channel_id,
+					authorId: data.author.id,
+					createdAt: data.timestamp || new Date().toISOString(),
+					replyToId,
+					contentLength: features.contentLength,
+					lineCount: features.lineCount,
+					fingerprint: features.fingerprint,
+					artifacts: JSON.stringify(features.artifacts)
+				})
+			}
 
 			// Check evaluation eligibility:
 			// 1. Immediately if operational/tool markers appear (e.g. tool execution, thought tags)

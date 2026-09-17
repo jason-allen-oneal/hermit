@@ -107,32 +107,6 @@ const buildPermissionDeniedContainer = () =>
 		{ accentColor: "#f85149" }
 	)
 
-export const syncSharedReviewCard = async (
-	client: Client,
-	reviewCase: ReviewCase
-) => {
-	if (!reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
-		return
-	}
-	try {
-		const container = buildReviewCardContainer(reviewCase, null, null, true)
-		await client.rest.patch(
-			Routes.channelMessage(
-				reviewCase.reviewChannelId,
-				reviewCase.reviewMessageId
-			),
-			{
-				body: serializePayload({
-					components: [container],
-					allowedMentions: { parse: [] }
-				})
-			}
-		)
-	} catch (error) {
-		console.warn("Failed to synchronize shared review card:", error)
-	}
-}
-
 export class ReviewDismissButton extends Button {
 	customId = "review-dismiss"
 	label = "Dismiss (Human)"
@@ -172,7 +146,15 @@ export class ReviewDismissButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id !== updated.reviewMessageId) {
+				const { syncSharedReviewCard } = await import(
+					"../services/reviewNotifier.js"
+				)
 				await syncSharedReviewCard(interaction.client, updated)
+			} else {
+				await updateReviewCase(caseId, {
+					cardRevision: (updated.cardRevision || 1) + 1,
+					syncedCardRevision: (updated.cardRevision || 1) + 1
+				})
 			}
 		}
 	}
@@ -218,7 +200,15 @@ export class ReviewWatchlistButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id !== updated.reviewMessageId) {
+				const { syncSharedReviewCard } = await import(
+					"../services/reviewNotifier.js"
+				)
 				await syncSharedReviewCard(interaction.client, updated)
+			} else {
+				await updateReviewCase(caseId, {
+					cardRevision: (updated.cardRevision || 1) + 1,
+					syncedCardRevision: (updated.cardRevision || 1) + 1
+				})
 			}
 		}
 	}
@@ -263,7 +253,15 @@ export class ReviewConfirmBotButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id !== updated.reviewMessageId) {
+				const { syncSharedReviewCard } = await import(
+					"../services/reviewNotifier.js"
+				)
 				await syncSharedReviewCard(interaction.client, updated)
+			} else {
+				await updateReviewCase(caseId, {
+					cardRevision: (updated.cardRevision || 1) + 1,
+					syncedCardRevision: (updated.cardRevision || 1) + 1
+				})
 			}
 		}
 	}

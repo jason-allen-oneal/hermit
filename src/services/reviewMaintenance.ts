@@ -3,7 +3,10 @@ import {
 	expireWatchlistCases,
 	pruneOldObservations
 } from "../data/review.js"
-import { recoverReviewEscalations } from "./reviewNotifier.js"
+import {
+	recoverReviewEscalations,
+	recoverSharedCardSync
+} from "./reviewNotifier.js"
 
 export const runReviewMaintenance = async (client: Client) => {
 	try {
@@ -15,6 +18,9 @@ export const runReviewMaintenance = async (client: Client) => {
 
 		// 3. Retry undelivered / failed review escalation cards
 		await recoverReviewEscalations(client)
+
+		// 4. Recover shared cards that failed synchronization
+		await recoverSharedCardSync(client)
 	} catch (error) {
 		console.error("Error in runReviewMaintenance:", error)
 	}

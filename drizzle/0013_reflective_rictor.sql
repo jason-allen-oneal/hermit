@@ -14,6 +14,8 @@ CREATE TABLE `review_cases` (
 	`review_message_id` text,
 	`review_channel_id` text,
 	`delivery_status` text DEFAULT 'pending' NOT NULL,
+	`card_revision` integer DEFAULT 1 NOT NULL,
+	`synced_card_revision` integer DEFAULT 1 NOT NULL,
 	`expires_at` text,
 	`decided_by_id` text,
 	`decision_reason` text,

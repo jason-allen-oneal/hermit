@@ -16,7 +16,11 @@ import {
 import ReviewCommand from "../src/commands/review.js"
 import { reviewConfig } from "../src/config/review.js"
 import * as reviewData from "../src/data/review.js"
-import { postReviewEscalationCard } from "../src/services/reviewNotifier.js"
+import {
+	postReviewEscalationCard,
+	recoverSharedCardSync,
+	syncSharedReviewCard
+} from "../src/services/reviewNotifier.js"
 import ReviewIngestMessageCreate from "../src/events/reviewIngestMessageCreate.js"
 import type { ReviewCase } from "../src/db/schema.js"
 import type { AnalysisReport, ReviewMessage } from "../src/review/types.js"
@@ -717,25 +721,156 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 		})
 
 		it("reconciles uncertain send without duplicate POST when card exists", async () => {
-			let postCount = 0
-			let markedDelivered = false
+			const origClientId = process.env.DISCORD_CLIENT_ID
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			try {
+				let postCount = 0
+				let markedDelivered = false
 
-			const uncertainCase: ReviewCase = {
-				id: 1,
-				caseId: "case-uncertain-1",
+				const uncertainCase: ReviewCase = {
+					id: 1,
+					caseId: "case-uncertain-1",
+					guildId: reviewConfig.guildId,
+					targetUserId: "target-user-rec",
+					status: "escalated",
+					heuristicScore: 90,
+					concordance: "High",
+					behavioralFamilies: "[]",
+					evidenceMessageId: null,
+					krillProbability: null,
+					krillBrief: null,
+					krillModel: null,
+					reviewMessageId: null,
+					reviewChannelId: reviewConfig.reviewChannelId,
+					deliveryStatus: "uncertain",
+					cardRevision: 1,
+					syncedCardRevision: 1,
+					expiresAt: null,
+					decidedById: null,
+					decisionReason: null,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString()
+				}
+
+				spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
+				spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
+					if (update.deliveryStatus === "delivered" && update.reviewMessageId === "existing-card-123") {
+						markedDelivered = true
+					}
+					return null
+				})
+
+				const mockClient = {
+					rest: {
+						get: async () => [
+							{
+								id: "existing-card-123",
+								author: { id: "bot-hermit-1", bot: true },
+								components: [{ content: "🦞 Claw & Order | Automation Review\ncaseId=case-uncertain-1\ntarget-user-rec" }]
+							}
+						],
+						post: async () => {
+							postCount++
+							return { id: "new-card-456" }
+						}
+					}
+				} as unknown as any
+
+				await postReviewEscalationCard(mockClient, uncertainCase, null, null)
+				expect(markedDelivered).toBe(true)
+				expect(postCount).toBe(0) // Reconciled read-only without duplicate POST
+			} finally {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			}
+		})
+
+		it("strictly rejects adopting foreign bot messages during reconciliation", async () => {
+			const origClientId = process.env.DISCORD_CLIENT_ID
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			try {
+				let postCount = 0
+				let markedDelivered = false
+
+				const uncertainCase: ReviewCase = {
+					id: 1,
+					caseId: "case-foreign-bot",
+					guildId: reviewConfig.guildId,
+					targetUserId: "target-user-rec",
+					status: "escalated",
+					heuristicScore: 90,
+					concordance: "High",
+					behavioralFamilies: "[]",
+					evidenceMessageId: null,
+					krillProbability: null,
+					krillBrief: null,
+					krillModel: null,
+					reviewMessageId: null,
+					reviewChannelId: reviewConfig.reviewChannelId,
+					deliveryStatus: "uncertain",
+					cardRevision: 1,
+					syncedCardRevision: 1,
+					expiresAt: null,
+					decidedById: null,
+					decisionReason: null,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString()
+				}
+
+				spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
+				spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
+					if (update.deliveryStatus === "delivered") {
+						markedDelivered = true
+					}
+					return null
+				})
+
+				const mockClient = {
+					rest: {
+						get: async () => [
+							{
+								id: "foreign-card-789",
+								author: { id: "foreign-bot-999", bot: true },
+								components: [{ content: "🦞 Claw & Order | Automation Review\ncaseId=case-foreign-bot\ntarget-user-rec" }]
+							}
+						],
+						post: async () => {
+							postCount++
+							return { id: "new-card-456" }
+						}
+					}
+				} as unknown as any
+
+				await postReviewEscalationCard(mockClient, uncertainCase, null, null)
+				expect(markedDelivered).toBe(false)
+				expect(postCount).toBe(0) // Uncertain status preserved without duplicate post
+			} finally {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			}
+		})
+
+		it("reopens existing card when a watchlist case escalates again", async () => {
+			let patchCalled = false
+			let postCalled = false
+			let patchedMessageId: string | null = null
+
+			const watchlistReEscalatedCase: ReviewCase = {
+				id: 2,
+				caseId: "case-watchlist-again",
 				guildId: reviewConfig.guildId,
-				targetUserId: "target-user-rec",
+				targetUserId: "target-user-watchlist",
 				status: "escalated",
-				heuristicScore: 90,
+				heuristicScore: 95,
 				concordance: "High",
 				behavioralFamilies: "[]",
 				evidenceMessageId: null,
 				krillProbability: null,
 				krillBrief: null,
 				krillModel: null,
-				reviewMessageId: null,
+				reviewMessageId: "existing-watchlist-card-msg",
 				reviewChannelId: reviewConfig.reviewChannelId,
-				deliveryStatus: "uncertain",
+				deliveryStatus: "delivered",
+				cardRevision: 2,
+				syncedCardRevision: 2,
 				expiresAt: null,
 				decidedById: null,
 				decisionReason: null,
@@ -743,33 +878,78 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
-			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
+			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "updateReviewCase").mockResolvedValue(null as any)
+
+			const mockClient = {
+				rest: {
+					patch: async (route: string) => {
+						patchCalled = true
+						patchedMessageId = route
+						return {}
+					},
+					post: async () => {
+						postCalled = true
+						return { id: "unexpected-post" }
+					}
+				}
+			} as unknown as any
+
+			await postReviewEscalationCard(mockClient, watchlistReEscalatedCase, null, null)
+			expect(patchCalled).toBe(true)
+			expect(patchedMessageId).toContain("existing-watchlist-card-msg")
+			expect(postCalled).toBe(false)
+		})
+
+		it("recovers shared cards with failed synchronization during maintenance", async () => {
+			let patchCalled = false
+
+			const outOfSyncCase: ReviewCase = {
+				id: 3,
+				caseId: "case-out-of-sync",
+				guildId: reviewConfig.guildId,
+				targetUserId: "target-user-sync",
+				status: "dismissed",
+				heuristicScore: 40,
+				concordance: "Low",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: null,
+				krillBrief: null,
+				krillModel: null,
+				reviewMessageId: "shared-card-msg-1",
+				reviewChannelId: reviewConfig.reviewChannelId,
+				deliveryStatus: "delivered",
+				cardRevision: 3,
+				syncedCardRevision: 2,
+				expiresAt: null,
+				decidedById: "staff-42",
+				decisionReason: "False positive",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			spyOn(reviewData, "listOutOfSyncCases").mockResolvedValue([outOfSyncCase])
+			let updatedSyncedRevision: number | undefined
 			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-				if (update.deliveryStatus === "delivered" && update.reviewMessageId === "existing-card-123") {
-					markedDelivered = true
+				if (update.syncedCardRevision !== undefined) {
+					updatedSyncedRevision = update.syncedCardRevision
 				}
 				return null
 			})
 
 			const mockClient = {
 				rest: {
-					get: async () => [
-						{
-							id: "existing-card-123",
-							author: { bot: true },
-							components: [{ content: "🦞 Claw & Order | Automation Review\ntarget-user-rec" }]
-						}
-					],
-					post: async () => {
-						postCount++
-						return { id: "new-card-456" }
+					patch: async () => {
+						patchCalled = true
+						return {}
 					}
 				}
 			} as unknown as any
 
-			await postReviewEscalationCard(mockClient, uncertainCase, null, null)
-			expect(markedDelivered).toBe(true)
-			expect(postCount).toBe(0) // Reconciled read-only without duplicate POST
+			await recoverSharedCardSync(mockClient)
+			expect(patchCalled).toBe(true)
+			expect(updatedSyncedRevision).toBe(4) // incremented cardRevision synced
 		})
 
 		it("aborts delivery immediately if case is no longer escalated", async () => {

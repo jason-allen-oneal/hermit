@@ -294,3 +294,71 @@ export const clearDiscrawlCache = () => {
 	cache = null
 	cachedPath = null
 }
+
+export const fetchRemoteDiscrawlObservations = async (
+	exportUrl: string,
+	secret: string,
+	guildId: string,
+	authorId: string,
+	windowDays = 7,
+	limit = 200
+): Promise<ReviewMessage[]> => {
+	try {
+		const url = new URL("/api/discrawl/observations", exportUrl)
+		url.searchParams.set("guildId", guildId)
+		url.searchParams.set("authorId", authorId)
+		url.searchParams.set("windowDays", String(windowDays))
+		url.searchParams.set("limit", String(limit))
+
+		const response = await fetch(url.toString(), {
+			headers: {
+				Authorization: `Bearer ${secret}`,
+				Accept: "application/json"
+			}
+		})
+
+		if (!response.ok) {
+			console.warn(`[DiscrawlRemote] Endpoint returned ${response.status}`)
+			return []
+		}
+
+		return (await response.json()) as ReviewMessage[]
+	} catch (error) {
+		console.warn("[DiscrawlRemote] Failed to fetch remote observations:", error)
+		return []
+	}
+}
+
+export const fetchRemoteDiscrawlCount = async (
+	exportUrl: string,
+	secret: string,
+	guildId: string,
+	authorId: string,
+	windowDays = 7
+): Promise<number> => {
+	try {
+		const url = new URL("/api/discrawl/count", exportUrl)
+		url.searchParams.set("guildId", guildId)
+		url.searchParams.set("authorId", authorId)
+		url.searchParams.set("windowDays", String(windowDays))
+
+		const response = await fetch(url.toString(), {
+			headers: {
+				Authorization: `Bearer ${secret}`,
+				Accept: "application/json"
+			}
+		})
+
+		if (!response.ok) {
+			console.warn(`[DiscrawlRemote] Endpoint returned ${response.status}`)
+			return 0
+		}
+
+		const data = (await response.json()) as { count?: number }
+		return typeof data.count === "number" ? data.count : 0
+	} catch (error) {
+		console.warn("[DiscrawlRemote] Failed to fetch remote count:", error)
+		return 0
+	}
+}
+

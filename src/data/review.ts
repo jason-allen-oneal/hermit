@@ -9,9 +9,12 @@ import {
 	type ReviewObservation
 } from "../db/schema.js"
 import type { ReviewMessage } from "../review/types.js"
+import { reviewConfig } from "../config/review.js"
 import {
 	getRecentDiscrawlObservations,
-	getDiscrawlObservationCount
+	getDiscrawlObservationCount,
+	fetchRemoteDiscrawlObservations,
+	fetchRemoteDiscrawlCount
 } from "../services/discrawl.js"
 
 const now = sql`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
@@ -19,6 +22,9 @@ const now = sql`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 export const recordObservation = async (
 	observation: NewReviewObservation
 ): Promise<ReviewObservation | null> => {
+	if (reviewConfig.discrawlExportPath || reviewConfig.discrawlExportUrl) {
+		return null
+	}
 	const [record] = await getDb()
 		.insert(reviewObservations)
 		.values(observation)
@@ -34,10 +40,19 @@ export const getRecentUserObservations = async (
 	windowDays = 7,
 	limit = 200
 ): Promise<ReviewMessage[]> => {
-	const discrawlPath = process.env.DISCRAWL_EXPORT_PATH
-	if (discrawlPath) {
+	if (reviewConfig.discrawlExportUrl) {
+		return fetchRemoteDiscrawlObservations(
+			reviewConfig.discrawlExportUrl,
+			reviewConfig.discrawlSecret || "",
+			guildId,
+			authorId,
+			windowDays,
+			limit
+		)
+	}
+	if (reviewConfig.discrawlExportPath) {
 		return getRecentDiscrawlObservations(
-			discrawlPath,
+			reviewConfig.discrawlExportPath,
 			guildId,
 			authorId,
 			windowDays,
@@ -252,9 +267,22 @@ export const getUserObservationCount = async (
 	authorId: string,
 	windowDays = 7
 ): Promise<number> => {
-	const discrawlPath = process.env.DISCRAWL_EXPORT_PATH
-	if (discrawlPath) {
-		return getDiscrawlObservationCount(discrawlPath, guildId, authorId, windowDays)
+	if (reviewConfig.discrawlExportUrl) {
+		return fetchRemoteDiscrawlCount(
+			reviewConfig.discrawlExportUrl,
+			reviewConfig.discrawlSecret || "",
+			guildId,
+			authorId,
+			windowDays
+		)
+	}
+	if (reviewConfig.discrawlExportPath) {
+		return getDiscrawlObservationCount(
+			reviewConfig.discrawlExportPath,
+			guildId,
+			authorId,
+			windowDays
+		)
 	}
 
 	const cutoff = new Date(Date.now() - windowDays * 86400000).toISOString()
@@ -271,3 +299,17 @@ export const getUserObservationCount = async (
 
 	return result?.count ?? 0
 }
+
+export const listOutOfSyncCases = async (limit = 10): Promise<ReviewCase[]> => {
+	return getDb()
+		.select()
+		.from(reviewCases)
+		.where(
+			and(
+				sql`review_message_id IS NOT NULL`,
+				sql`synced_card_revision < card_revision`
+			)
+		)
+		.limit(limit)
+}
+

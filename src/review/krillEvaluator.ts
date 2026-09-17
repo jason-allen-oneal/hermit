@@ -29,9 +29,9 @@ export async function evaluateWithKrill(
 Your role is to evaluate whether a flagged Discord account in the 175,000-member OpenClaw community is an automated agent (bot) or a human user.
 You are given deterministic behavioral telemetry, timing statistics, and stylometric features.
 
-Analyze the evidence impartially and provide a calibrated assessment in JSON format:
+Analyze the evidence impartially and provide an estimated assessment in JSON format:
 {
-  "automationProbability": <number between 0.00 and 1.00 representing exact calibrated probability>,
+  "automationProbability": <number between 0.00 and 1.00 representing model-estimated assessment probability>,
   "confidence": <"high" | "moderate" | "low">,
   "brief": <concise 2-3 sentence factual briefing explaining why the user was or wasn't flagged and the key behavioral traits>,
   "disposition": <"confirmed_bot" | "likely_bot" | "uncertain" | "likely_human">,

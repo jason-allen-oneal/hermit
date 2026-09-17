@@ -19,5 +19,11 @@ export const reviewConfig = {
 	maxObservationsPerSample: 100,
 	get discrawlExportPath(): string | undefined {
 		return process.env.DISCRAWL_EXPORT_PATH
+	},
+	get discrawlExportUrl(): string | undefined {
+		return process.env.DISCRAWL_EXPORT_URL
+	},
+	get discrawlSecret(): string | undefined {
+		return process.env.DISCRAWL_SECRET || process.env.DEPLOY_SECRET
 	}
 }

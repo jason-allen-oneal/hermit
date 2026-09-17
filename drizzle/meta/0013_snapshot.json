@@ -1673,6 +1673,22 @@
           "autoincrement": false,
           "default": "'pending'"
         },
+        "card_revision": {
+          "name": "card_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "synced_card_revision": {
+          "name": "synced_card_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
         "expires_at": {
           "name": "expires_at",
           "type": "text",

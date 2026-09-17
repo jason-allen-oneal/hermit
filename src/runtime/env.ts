@@ -29,6 +29,8 @@ declare global {
 		WORKER_EVENT_SECRET: string
 		WORKER_EVENT_URL: string
 		DISCRAWL_EXPORT_PATH?: string
+		DISCRAWL_EXPORT_URL?: string
+		DISCRAWL_SECRET?: string
 	}
 }
 

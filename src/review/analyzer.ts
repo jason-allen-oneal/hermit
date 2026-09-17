@@ -258,7 +258,7 @@ export function analyze(input: ReviewAnalyzerInput): AnalysisReport {
 		familyScores,
 		signals,
 		limitations: [
-			"Deterministic heuristics provide early detection; Krill provides calibrated probability.",
+			"Deterministic heuristics provide early detection; Krill provides model-estimated probability.",
 			"Structural fingerprints and metadata only; no raw message text is retained.",
 			...(rows.length === 0
 				? ["No observed messages in the sampled window."]
