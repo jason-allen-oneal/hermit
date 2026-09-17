@@ -30,6 +30,20 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 		) {
 			return
 		}
+
+		// Enforce bounded staff pilot rollout boundary:
+		// In pilot mode (default), automatic background message ingestion and evaluation are disabled.
+		// Review operations are invoked manually by staff via /review against Discrawl exports.
+		if (!reviewConfig.automaticScreeningEnabled) {
+			return
+		}
+		if (
+			reviewConfig.pilotChannelIds &&
+			!reviewConfig.pilotChannelIds.includes(data.channel_id)
+		) {
+			return
+		}
+
 		if (!data.content && (!data.attachments || data.attachments.length === 0)) {
 			return
 		}

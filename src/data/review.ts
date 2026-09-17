@@ -1,4 +1,4 @@
-import { and, eq, gte, sql, desc, inArray } from "drizzle-orm"
+import { and, eq, gte, gt, sql, desc, asc, inArray } from "drizzle-orm"
 import { getDb } from "../db.js"
 import {
 	reviewCases,
@@ -258,12 +258,55 @@ export const markReviewCardSynced = async (
 	return updated ?? null
 }
 
+export const markReviewCardStaleWrite = async (
+	caseId: string,
+	renderedRevision: number
+): Promise<ReviewCase | null> => {
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			updatedAt: now
+		})
+		.where(
+			and(
+				eq(reviewCases.caseId, caseId),
+				gt(reviewCases.cardRevision, renderedRevision)
+			)
+		)
+		.returning()
+
+	return updated ?? null
+}
+
+export const allocateReescalationRevision = async (
+	caseId: string
+): Promise<ReviewCase | null> => {
+	const [record] = await getDb()
+		.update(reviewCases)
+		.set({
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			deliveryStatus: "delivering",
+			updatedAt: now
+		})
+		.where(
+			and(
+				eq(reviewCases.caseId, caseId),
+				eq(reviewCases.status, "escalated")
+			)
+		)
+		.returning()
+
+	return record ?? null
+}
+
 export const getUndeliveredEscalations = async (
 	guildId: string,
 	limit = 10,
 	claimTimeoutMs = 120_000
 ): Promise<ReviewCase[]> => {
 	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
+	const uncertainBackoffCutoff = new Date(Date.now() - 60_000).toISOString()
 	return getDb()
 		.select()
 		.from(reviewCases)
@@ -271,8 +314,18 @@ export const getUndeliveredEscalations = async (
 			and(
 				eq(reviewCases.guildId, guildId),
 				eq(reviewCases.status, "escalated"),
-				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed', 'uncertain') OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
+				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed') 
+					OR (${reviewCases.deliveryStatus} = 'uncertain' AND ${reviewCases.updatedAt} <= ${uncertainBackoffCutoff})
+					OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
 			)
+		)
+		.orderBy(
+			sql`CASE 
+				WHEN ${reviewCases.deliveryStatus} = 'pending' THEN 0 
+				WHEN ${reviewCases.deliveryStatus} = 'failed' THEN 1 
+				ELSE 2 
+			END ASC`,
+			asc(reviewCases.updatedAt)
 		)
 		.limit(limit)
 }

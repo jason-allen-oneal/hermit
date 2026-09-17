@@ -14,6 +14,7 @@ import {
 import { reviewConfig } from "../config/review.js"
 import {
 	getReviewCase,
+	markReviewCardStaleWrite,
 	markReviewCardSynced,
 	recordReviewCaseDecision,
 	updateReviewCase
@@ -151,7 +152,14 @@ export class ReviewDismissButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id === updated.reviewMessageId) {
-				await markReviewCardSynced(caseId, updated.cardRevision)
+				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
+				if (!synced) {
+					await markReviewCardStaleWrite(caseId, updated.cardRevision)
+					const { syncSharedReviewCard } = await import(
+						"../services/reviewNotifier.js"
+					)
+					await syncSharedReviewCard(interaction.client, updated)
+				}
 			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"
@@ -202,7 +210,14 @@ export class ReviewWatchlistButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id === updated.reviewMessageId) {
-				await markReviewCardSynced(caseId, updated.cardRevision)
+				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
+				if (!synced) {
+					await markReviewCardStaleWrite(caseId, updated.cardRevision)
+					const { syncSharedReviewCard } = await import(
+						"../services/reviewNotifier.js"
+					)
+					await syncSharedReviewCard(interaction.client, updated)
+				}
 			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"
@@ -252,7 +267,14 @@ export class ReviewConfirmBotButton extends Button {
 				components: [container]
 			})
 			if (interaction.message?.id === updated.reviewMessageId) {
-				await markReviewCardSynced(caseId, updated.cardRevision)
+				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
+				if (!synced) {
+					await markReviewCardStaleWrite(caseId, updated.cardRevision)
+					const { syncSharedReviewCard } = await import(
+						"../services/reviewNotifier.js"
+					)
+					await syncSharedReviewCard(interaction.client, updated)
+				}
 			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"

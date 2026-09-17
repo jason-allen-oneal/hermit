@@ -619,7 +619,37 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			expect(recordCalled).toBe(false)
 		})
 
-		it("triggers evaluation on periodic count (every 10 messages) without tool markers", async () => {
+		it("drops ordinary guild messages without recording observations when automatic screening is disabled (pilot mode)", async () => {
+			const listener = new ReviewIngestMessageCreate()
+			let recordCalled = false
+
+			spyOn(reviewData, "recordObservation").mockImplementation(async () => {
+				recordCalled = true
+				return null as any
+			})
+
+			const prevFlag = process.env.ENABLE_AUTOMATIC_SCREENING
+			delete process.env.ENABLE_AUTOMATIC_SCREENING
+			try {
+				await listener.handle(
+					{
+						id: "msg-pilot-drop",
+						guild_id: reviewConfig.guildId,
+						channel_id: "channel-1",
+						author: { id: "user-pilot" },
+						content: "message during staff-invoked pilot",
+						timestamp: new Date().toISOString()
+					} as any,
+					{} as any
+				)
+				expect(recordCalled).toBe(false)
+			} finally {
+				if (prevFlag !== undefined) process.env.ENABLE_AUTOMATIC_SCREENING = prevFlag
+				else delete process.env.ENABLE_AUTOMATIC_SCREENING
+			}
+		})
+
+		it("triggers evaluation on periodic count (every 10 messages) when automatic screening is enabled", async () => {
 			const listener = new ReviewIngestMessageCreate()
 			let evaluatedReport = false
 
@@ -634,19 +664,25 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				return []
 			})
 
-			await listener.handle(
-				{
-					id: "msg-comm-10",
-					guild_id: reviewConfig.guildId,
-					channel_id: "channel-1",
-					author: { id: "user-stylometry-only" },
-					content: "normal message with no tool markers at all",
-					timestamp: new Date().toISOString()
-				} as any,
-				{} as any
-			)
-
-			expect(evaluatedReport).toBe(true)
+			const prevFlag = process.env.ENABLE_AUTOMATIC_SCREENING
+			process.env.ENABLE_AUTOMATIC_SCREENING = "true"
+			try {
+				await listener.handle(
+					{
+						id: "msg-comm-10",
+						guild_id: reviewConfig.guildId,
+						channel_id: "channel-1",
+						author: { id: "user-stylometry-only" },
+						content: "normal message with no tool markers at all",
+						timestamp: new Date().toISOString()
+					} as any,
+					{} as any
+				)
+				expect(evaluatedReport).toBe(true)
+			} finally {
+				if (prevFlag !== undefined) process.env.ENABLE_AUTOMATIC_SCREENING = prevFlag
+				else delete process.env.ENABLE_AUTOMATIC_SCREENING
+			}
 		})
 	})
 
@@ -896,8 +932,13 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			}
 
 			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "allocateReescalationRevision").mockResolvedValue({
+				...watchlistReEscalatedCase,
+				cardRevision: 3
+			})
 			spyOn(reviewData, "getReviewCase").mockResolvedValue(watchlistReEscalatedCase)
 			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "markReviewCardStaleWrite").mockResolvedValue(null)
 			spyOn(reviewData, "updateReviewCase").mockResolvedValue(null as any)
 
 			const mockClient = {
@@ -1263,6 +1304,203 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			const inDb = await reviewData.getReviewCase(`case-${reviewConfig.guildId}-open-target`)
 			expect(inDb!.status).toBe("escalated")
 			expect(inDb!.deliveryStatus).toBe("pending") // Ready for delivery recovery!
+		})
+
+		it("schedules repair via markReviewCardStaleWrite when an older write finishes last", async () => {
+			await reviewData.createReviewCase({
+				caseId: "case-stale-repair",
+				guildId: reviewConfig.guildId,
+				targetUserId: "user-stale-repair",
+				status: "escalated",
+				heuristicScore: 75,
+				concordance: "Moderate",
+				behavioralFamilies: "[]",
+				cardRevision: 3,
+				syncedCardRevision: 3
+			})
+
+			// An older delayed write for revision 2 finishes
+			const syncResult = await reviewData.markReviewCardSynced("case-stale-repair", 2)
+			expect(syncResult).toBeNull() // Rejected
+
+			// Schedule repair
+			const staleWrite = await reviewData.markReviewCardStaleWrite("case-stale-repair", 2)
+			expect(staleWrite).not.toBeNull()
+			expect(staleWrite!.cardRevision).toBe(4) // Bumped!
+
+			const inDb = await reviewData.getReviewCase("case-stale-repair")
+			// cardRevision (4) > syncedCardRevision (3): maintenance will discover and heal!
+			expect(inDb!.cardRevision).toBe(4)
+			expect(inDb!.syncedCardRevision).toBe(3)
+		})
+
+		it("allocates re-escalation revisions atomically requiring status to remain escalated", async () => {
+			await reviewData.createReviewCase({
+				caseId: "case-reesc-atomic",
+				guildId: reviewConfig.guildId,
+				targetUserId: "user-reesc",
+				status: "escalated",
+				heuristicScore: 85,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				cardRevision: 1
+			})
+
+			const allocated = await reviewData.allocateReescalationRevision("case-reesc-atomic")
+			expect(allocated).not.toBeNull()
+			expect(allocated!.cardRevision).toBe(2)
+			expect(allocated!.deliveryStatus).toBe("delivering")
+
+			// If staff intervenes and dismisses the case
+			await reviewData.recordReviewCaseDecision("case-reesc-atomic", {
+				status: "dismissed",
+				expiresAt: null,
+				decidedById: "staff-1",
+				decisionReason: "dismissed"
+			})
+
+			// Subsequent re-escalation attempt fails because status is dismissed
+			const rejected = await reviewData.allocateReescalationRevision("case-reesc-atomic")
+			expect(rejected).toBeNull()
+		})
+
+		it("preserves revisions and reconciles staff decision when adopting delivery receipt", async () => {
+			const origClientId = process.env.DISCORD_CLIENT_ID
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			try {
+				await reviewData.createReviewCase({
+					caseId: "case-receipt-rev",
+					guildId: reviewConfig.guildId,
+					targetUserId: "user-receipt",
+					status: "escalated",
+					heuristicScore: 90,
+					concordance: "High",
+					behavioralFamilies: "[]",
+					deliveryStatus: "uncertain",
+					cardRevision: 1,
+					syncedCardRevision: 1
+				})
+
+				const initialCase = (await reviewData.getReviewCase("case-receipt-rev"))!
+
+				let patchCalled = false
+				const mockClient = {
+					rest: {
+						get: async () => {
+							// Staff dismisses the case WHILE history is awaited (bumping cardRevision to 2)
+							await reviewData.recordReviewCaseDecision("case-receipt-rev", {
+								status: "dismissed",
+								expiresAt: null,
+								decidedById: "staff-quick",
+								decisionReason: "Intervened during receipt lookup"
+							})
+							return [
+								{
+									id: "receipt-msg-999",
+									author: { id: "bot-hermit-1", bot: true },
+									components: [{ content: `caseId=case-receipt-rev\nuser-receipt` }]
+								}
+							]
+						},
+						patch: async () => {
+							patchCalled = true
+							return {}
+						}
+					}
+				} as unknown as any
+
+				await postReviewEscalationCard(mockClient, initialCase, null, null)
+
+				const inDb = await reviewData.getReviewCase("case-receipt-rev")
+				expect(inDb!.deliveryStatus).toBe("delivered")
+				expect(inDb!.reviewMessageId).toBe("receipt-msg-999")
+				// Desired revision (2) was NOT overwritten by older snapshot!
+				expect(inDb!.cardRevision).toBe(2)
+				// Reconciled and patched the staff decision onto the discovered card
+				expect(patchCalled).toBe(true)
+			} finally {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			}
+		})
+
+		it("rotates recovery candidates fairly and applies retry backoff to uncertain deliveries", async () => {
+			const now = Date.now()
+			// Insert 2 uncertain cases: one recent (under 60s backoff) and one old (>60s backoff)
+			d1Owner.database.run(
+				`INSERT INTO review_cases (case_id, guild_id, target_user_id, status, heuristic_score, concordance, behavioral_families, delivery_status, updated_at)
+				 VALUES ('case-unc-recent', ?, 'u-rec', 'escalated', 90, 'High', '[]', 'uncertain', ?),
+				        ('case-unc-old', ?, 'u-old', 'escalated', 90, 'High', '[]', 'uncertain', ?),
+				        ('case-pending-new', ?, 'u-pen', 'escalated', 90, 'High', '[]', 'pending', ?)`,
+				[
+					reviewConfig.guildId,
+					new Date(now - 10_000).toISOString(), // 10s ago (within 60s backoff)
+					reviewConfig.guildId,
+					new Date(now - 120_000).toISOString(), // 120s ago (eligible)
+					reviewConfig.guildId,
+					new Date(now - 5_000).toISOString() // pending
+				]
+			)
+
+			const escalations = await reviewData.getUndeliveredEscalations(reviewConfig.guildId, 10)
+			const caseIds = escalations.map((c) => c.caseId)
+
+			// Pending must come first, followed by eligible uncertain (>60s old)
+			expect(caseIds[0]).toBe("case-pending-new")
+			expect(caseIds).toContain("case-unc-old")
+			// Recent uncertain (<60s backoff) is not returned, preventing starvation!
+			expect(caseIds).not.toContain("case-unc-recent")
+		})
+
+		it("preserves active buttons when recovering an escalated card and closes buttons when decided", async () => {
+			await reviewData.createReviewCase({
+				caseId: "case-buttons-esc",
+				guildId: reviewConfig.guildId,
+				targetUserId: "u-buttons",
+				status: "escalated",
+				heuristicScore: 80,
+				concordance: "Moderate",
+				behavioralFamilies: "[]",
+				reviewMessageId: "msg-esc-buttons",
+				reviewChannelId: reviewConfig.reviewChannelId,
+				cardRevision: 2,
+				syncedCardRevision: 1
+			})
+
+			let renderedPayload: any = null
+			const mockClient = {
+				rest: {
+					patch: async (_route: string, options: any) => {
+						renderedPayload = options.body
+						return {}
+					}
+				}
+			} as unknown as any
+
+			const escCase = (await reviewData.getReviewCase("case-buttons-esc"))!
+			await syncSharedReviewCard(mockClient, escCase)
+
+			// The payload components must contain the active buttons Row since status is escalated
+			const componentsStr = JSON.stringify(renderedPayload)
+			expect(componentsStr).toContain("review-dismiss")
+			expect(componentsStr).toContain("review-watchlist")
+			expect(componentsStr).toContain("review-confirm-bot")
+
+			// Now mark the case as dismissed and bump cardRevision
+			await reviewData.recordReviewCaseDecision("case-buttons-esc", {
+				status: "dismissed",
+				expiresAt: null,
+				decidedById: "staff-1",
+				decisionReason: "done"
+			})
+
+			const dismissedCase = (await reviewData.getReviewCase("case-buttons-esc"))!
+			await syncSharedReviewCard(mockClient, dismissedCase)
+
+			// Now the payload components should NOT contain the buttons (closed = true)
+			const dismissedComponentsStr = JSON.stringify(renderedPayload)
+			expect(dismissedComponentsStr).not.toContain("review-dismiss")
+			expect(dismissedComponentsStr).not.toContain("review-watchlist")
+			expect(dismissedComponentsStr).not.toContain("review-confirm-bot")
 		})
 	})
 })

@@ -1,10 +1,12 @@
 import { type Client, Routes, serializePayload } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
 import {
+	allocateReescalationRevision,
 	claimReviewCaseDelivery,
 	getReviewCase,
 	getUndeliveredEscalations,
 	listOutOfSyncCases,
+	markReviewCardStaleWrite,
 	markReviewCardSynced,
 	updateReviewCase
 } from "../data/review.js"
@@ -87,16 +89,12 @@ export async function postReviewEscalationCard(
 	// If the case already has a reviewMessageId (e.g. watchlist case escalating again),
 	// reopen/refresh the existing card with active buttons rather than posting a duplicate
 	if (claimedCase.reviewMessageId) {
-		const freshCase = await getReviewCase(claimedCase.caseId)
-		if (!freshCase || freshCase.status !== "escalated") {
+		const allocated = await allocateReescalationRevision(claimedCase.caseId)
+		if (!allocated || allocated.status !== "escalated") {
 			return
 		}
-		const nextRevision = (freshCase.cardRevision || 1) + 1
-		await updateReviewCase(claimedCase.caseId, {
-			cardRevision: nextRevision
-		})
 
-		const container = buildReviewCardContainer(freshCase, report, krill, false)
+		const container = buildReviewCardContainer(allocated, report, krill, false)
 		const payload = serializePayload({
 			components: [container],
 			allowedMentions: { parse: [] }
@@ -104,23 +102,34 @@ export async function postReviewEscalationCard(
 
 		try {
 			await client.rest.patch(
-				Routes.channelMessage(channelId, claimedCase.reviewMessageId),
+				Routes.channelMessage(channelId, allocated.reviewMessageId!),
 				{ body: payload }
 			)
-			await markReviewCardSynced(claimedCase.caseId, nextRevision)
-			await updateReviewCase(claimedCase.caseId, {
-				reviewChannelId: channelId,
-				deliveryStatus: "delivered"
-			})
+			const synced = await markReviewCardSynced(
+				allocated.caseId,
+				allocated.cardRevision
+			)
+			if (!synced) {
+				await markReviewCardStaleWrite(
+					allocated.caseId,
+					allocated.cardRevision
+				)
+				await syncSharedReviewCard(client, allocated)
+			} else {
+				await updateReviewCase(allocated.caseId, {
+					reviewChannelId: channelId,
+					deliveryStatus: "delivered"
+				})
+			}
 			return
 		} catch (patchError: any) {
 			if (patchError?.status === 404) {
 				// Old card deleted in Discord; clear messageId and proceed to send fresh
-				await updateReviewCase(claimedCase.caseId, { reviewMessageId: null })
+				await updateReviewCase(allocated.caseId, { reviewMessageId: null })
 				claimedCase.reviewMessageId = null
 			} else {
 				console.warn("[ReviewNotifier] Failed to refresh existing card:", patchError)
-				await updateReviewCase(claimedCase.caseId, { deliveryStatus: "uncertain" })
+				await updateReviewCase(allocated.caseId, { deliveryStatus: "uncertain" })
 				return
 			}
 		}
@@ -140,13 +149,24 @@ export async function postReviewEscalationCard(
 			claimedCase.targetUserId
 		)
 		if (lookup.status === "found") {
+			const currentCase = (await getReviewCase(claimedCase.caseId)) ?? claimedCase
 			await updateReviewCase(claimedCase.caseId, {
 				reviewMessageId: lookup.messageId,
 				reviewChannelId: channelId,
-				deliveryStatus: "delivered",
-				cardRevision: claimedCase.cardRevision || 1,
-				syncedCardRevision: claimedCase.cardRevision || 1
+				deliveryStatus: "delivered"
 			})
+			// If staff intervened (dismissed/watchlist) while awaiting history,
+			// or if the card needs updating to match current state, synchronize it!
+			if (
+				currentCase.status !== "escalated" ||
+				currentCase.cardRevision > currentCase.syncedCardRevision
+			) {
+				await syncSharedReviewCard(client, {
+					...currentCase,
+					reviewMessageId: lookup.messageId,
+					reviewChannelId: channelId
+				})
+			}
 			return
 		}
 		// Inconclusive or not found: preserve uncertainty; do not send another POST
@@ -261,8 +281,12 @@ export async function syncSharedReviewCard(
 	}
 
 	const renderedRevision = fresh.cardRevision
+	// Preserve active buttons when recovering an escalated card:
+	// If case is still escalated, render actionable buttons (closed = false);
+	// if decided (dismissed, watchlist, confirmed_bot), render closed state (closed = true).
+	const isClosed = fresh.status !== "escalated"
 	try {
-		const container = buildReviewCardContainer(fresh, null, null, true)
+		const container = buildReviewCardContainer(fresh, null, null, isClosed)
 		await client.rest.patch(
 			Routes.channelMessage(
 				fresh.reviewChannelId,
@@ -276,7 +300,20 @@ export async function syncSharedReviewCard(
 			}
 		)
 		const synced = await markReviewCardSynced(fresh.caseId, renderedRevision)
-		return !!synced
+		if (!synced) {
+			const staleWrite = await markReviewCardStaleWrite(
+				fresh.caseId,
+				renderedRevision
+			)
+			if (
+				staleWrite &&
+				staleWrite.cardRevision > staleWrite.syncedCardRevision
+			) {
+				return await syncSharedReviewCard(client, staleWrite)
+			}
+			return false
+		}
+		return true
 	} catch (error) {
 		console.warn("Failed to synchronize shared review card:", error)
 		return false

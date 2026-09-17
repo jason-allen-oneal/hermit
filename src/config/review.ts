@@ -25,5 +25,19 @@ export const reviewConfig = {
 	},
 	get discrawlSecret(): string | undefined {
 		return process.env.DISCRAWL_SECRET || process.env.DEPLOY_SECRET
+	},
+	get automaticScreeningEnabled(): boolean {
+		return (
+			process.env.ENABLE_AUTOMATIC_SCREENING === "1" ||
+			process.env.ENABLE_AUTOMATIC_SCREENING === "true"
+		)
+	},
+	get pilotChannelIds(): string[] | null {
+		const raw = process.env.REVIEW_PILOT_CHANNEL_IDS
+		if (!raw) return null
+		return raw
+			.split(",")
+			.map((id) => id.trim())
+			.filter(Boolean)
 	}
 }
