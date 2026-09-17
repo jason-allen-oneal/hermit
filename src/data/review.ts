@@ -196,6 +196,7 @@ export const claimReviewCaseDelivery = async (
 	const [claimed] = await getDb()
 		.update(reviewCases)
 		.set({
+			previousDeliveryStatus: reviewCases.deliveryStatus,
 			deliveryStatus: "delivering",
 			updatedAt: now
 		})
@@ -209,6 +210,52 @@ export const claimReviewCaseDelivery = async (
 		.returning()
 
 	return claimed ?? null
+}
+
+export const recordReviewCaseDecision = async (
+	caseId: string,
+	decision: {
+		status: "dismissed" | "watchlist" | "confirmed_bot"
+		expiresAt?: string | null
+		decidedById?: string | null
+		decisionReason: string
+	}
+): Promise<ReviewCase | null> => {
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			status: decision.status,
+			expiresAt: decision.expiresAt ?? null,
+			decidedById: decision.decidedById,
+			decisionReason: decision.decisionReason,
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			updatedAt: now
+		})
+		.where(eq(reviewCases.caseId, caseId))
+		.returning()
+
+	return updated ?? null
+}
+
+export const markReviewCardSynced = async (
+	caseId: string,
+	revision: number
+): Promise<ReviewCase | null> => {
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			syncedCardRevision: revision,
+			updatedAt: now
+		})
+		.where(
+			and(
+				eq(reviewCases.caseId, caseId),
+				eq(reviewCases.cardRevision, revision)
+			)
+		)
+		.returning()
+
+	return updated ?? null
 }
 
 export const getUndeliveredEscalations = async (

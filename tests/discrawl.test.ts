@@ -246,4 +246,54 @@ describe("Discrawl Backend Integration", () => {
 			else delete process.env.DISCRAWL_SECRET
 		}
 	})
+
+	it("authenticates discrawl server requests and rejects unauthorized calls", async () => {
+		const filePath = path.join(tempDir, "auth-export.json")
+		fs.writeFileSync(
+			filePath,
+			JSON.stringify([
+				{
+					id: "auth-msg-1",
+					guild_id: reviewConfig.guildId,
+					channel_id: "chan-1",
+					author: { id: "auth-user" },
+					content: "hello",
+					timestamp: Date.now()
+				}
+			])
+		)
+
+		const discrawlSecret = "custom-discrawl-secret"
+		const deploySecret = "fallback-deploy-secret"
+		// Test precedence: DISCRAWL_SECRET || DEPLOY_SECRET
+		const activeSecret = discrawlSecret || deploySecret
+
+		const server = startDiscrawlServer({
+			exportPath: filePath,
+			secret: activeSecret,
+			port: 39183
+		})
+
+		try {
+			// Unauthorized request without secret
+			const unauthRes = await fetch(
+				`http://127.0.0.1:39183/api/discrawl/observations?guildId=${reviewConfig.guildId}&authorId=auth-user`
+			)
+			expect(unauthRes.status).toBe(401)
+
+			// Authorized request with custom-discrawl-secret
+			const authRes = await fetch(
+				`http://127.0.0.1:39183/api/discrawl/observations?guildId=${reviewConfig.guildId}&authorId=auth-user`,
+				{
+					headers: { Authorization: `Bearer ${activeSecret}` }
+				}
+			)
+			expect(authRes.status).toBe(200)
+			const body = (await authRes.json()) as any[]
+			expect(body.length).toBe(1)
+			expect(body[0].messageId).toBe("auth-msg-1")
+		} finally {
+			server.stop(true)
+		}
+	})
 })

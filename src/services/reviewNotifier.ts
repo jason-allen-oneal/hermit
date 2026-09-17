@@ -5,6 +5,7 @@ import {
 	getReviewCase,
 	getUndeliveredEscalations,
 	listOutOfSyncCases,
+	markReviewCardSynced,
 	updateReviewCase
 } from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
@@ -86,7 +87,16 @@ export async function postReviewEscalationCard(
 	// If the case already has a reviewMessageId (e.g. watchlist case escalating again),
 	// reopen/refresh the existing card with active buttons rather than posting a duplicate
 	if (claimedCase.reviewMessageId) {
-		const container = buildReviewCardContainer(claimedCase, report, krill, false)
+		const freshCase = await getReviewCase(claimedCase.caseId)
+		if (!freshCase || freshCase.status !== "escalated") {
+			return
+		}
+		const nextRevision = (freshCase.cardRevision || 1) + 1
+		await updateReviewCase(claimedCase.caseId, {
+			cardRevision: nextRevision
+		})
+
+		const container = buildReviewCardContainer(freshCase, report, krill, false)
 		const payload = serializePayload({
 			components: [container],
 			allowedMentions: { parse: [] }
@@ -97,11 +107,10 @@ export async function postReviewEscalationCard(
 				Routes.channelMessage(channelId, claimedCase.reviewMessageId),
 				{ body: payload }
 			)
+			await markReviewCardSynced(claimedCase.caseId, nextRevision)
 			await updateReviewCase(claimedCase.caseId, {
 				reviewChannelId: channelId,
-				deliveryStatus: "delivered",
-				cardRevision: (claimedCase.cardRevision || 1) + 1,
-				syncedCardRevision: (claimedCase.cardRevision || 1) + 1
+				deliveryStatus: "delivered"
 			})
 			return
 		} catch (patchError: any) {
@@ -117,9 +126,13 @@ export async function postReviewEscalationCard(
 		}
 	}
 
-	// If the case is in uncertain state, reconcile against history.
-	// Absence from bounded history is NOT permission to resend (avoids duplicates).
-	if (claimedCase.deliveryStatus === "uncertain") {
+	// Treat uncertain deliveries and stale claims conservatively:
+	// A stale claim (>120s) means a previous worker may have already sent the card before being interrupted.
+	const wasUncertain =
+		claimedCase.previousDeliveryStatus === "uncertain" ||
+		claimedCase.previousDeliveryStatus === "delivering"
+
+	if (wasUncertain) {
 		const lookup = await findExistingReviewCard(
 			client,
 			channelId,
@@ -130,7 +143,9 @@ export async function postReviewEscalationCard(
 			await updateReviewCase(claimedCase.caseId, {
 				reviewMessageId: lookup.messageId,
 				reviewChannelId: channelId,
-				deliveryStatus: "delivered"
+				deliveryStatus: "delivered",
+				cardRevision: claimedCase.cardRevision || 1,
+				syncedCardRevision: claimedCase.cardRevision || 1
 			})
 			return
 		}
@@ -138,6 +153,9 @@ export async function postReviewEscalationCard(
 		console.warn(
 			`[ReviewNotifier] Delivery for case ${claimedCase.caseId} remains uncertain; reconciliation did not find Hermit card`
 		)
+		await updateReviewCase(claimedCase.caseId, {
+			deliveryStatus: "uncertain"
+		})
 		return
 	}
 
@@ -173,7 +191,7 @@ export async function postReviewEscalationCard(
 			allowedMentions: { parse: [] }
 		})
 		const nonce = await generateNonce(
-			`review-escalate:${claimedCase.caseId}:${claimedCase.updatedAt}`
+			`review-escalate:${claimedCase.caseId}:${claimedCase.cardRevision || 1}`
 		)
 
 		const sent = (await client.rest.post(Routes.channelMessages(channelId), {
@@ -233,17 +251,22 @@ export async function syncSharedReviewCard(
 	if (!reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
 		return false
 	}
-	const nextRevision = (reviewCase.cardRevision || 1) + 1
-	await updateReviewCase(reviewCase.caseId, {
-		cardRevision: nextRevision
-	})
 
+	const fresh = await getReviewCase(reviewCase.caseId)
+	if (!fresh || !fresh.reviewMessageId || !fresh.reviewChannelId) {
+		return false
+	}
+	if (fresh.cardRevision <= fresh.syncedCardRevision) {
+		return true // Already up to date
+	}
+
+	const renderedRevision = fresh.cardRevision
 	try {
-		const container = buildReviewCardContainer(reviewCase, null, null, true)
+		const container = buildReviewCardContainer(fresh, null, null, true)
 		await client.rest.patch(
 			Routes.channelMessage(
-				reviewCase.reviewChannelId,
-				reviewCase.reviewMessageId
+				fresh.reviewChannelId,
+				fresh.reviewMessageId
 			),
 			{
 				body: serializePayload({
@@ -252,10 +275,8 @@ export async function syncSharedReviewCard(
 				})
 			}
 		)
-		await updateReviewCase(reviewCase.caseId, {
-			syncedCardRevision: nextRevision
-		})
-		return true
+		const synced = await markReviewCardSynced(fresh.caseId, renderedRevision)
+		return !!synced
 	} catch (error) {
 		console.warn("Failed to synchronize shared review card:", error)
 		return false

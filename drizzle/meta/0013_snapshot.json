@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7b092a3e-2125-4013-999e-e32da449f6a3",
-  "prevId": "30731fe5-aff9-413c-b7c6-cbe4ac734ebc",
+  "id": "8c3f7a82-5471-4f0d-9035-fcbf634c3a6f",
+  "prevId": "7b092a3e-2125-4013-999e-e32da449f6a3",
   "tables": {
     "action_cooldown_events": {
       "name": "action_cooldown_events",
@@ -1667,6 +1667,14 @@
         },
         "delivery_status": {
           "name": "delivery_status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'pending'"
+        },
+        "previous_delivery_status": {
+          "name": "previous_delivery_status",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

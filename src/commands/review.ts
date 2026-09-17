@@ -141,12 +141,31 @@ export default class ReviewCommand extends BaseCommand {
 		const caseId = `case-${guildId}-${targetUserId}`
 		let reviewCase = await getReviewCase(caseId)
 
+		const isWatchlistActive =
+			reviewCase?.status === "watchlist" &&
+			reviewCase.expiresAt &&
+			Date.parse(reviewCase.expiresAt) > Date.now()
+
+		let targetStatus: string
+		if (
+			reviewCase?.status === "dismissed" ||
+			reviewCase?.status === "confirmed_bot"
+		) {
+			targetStatus = reviewCase.status
+		} else if (isWatchlistActive) {
+			targetStatus = "watchlist"
+		} else if (report.priority === "review-recommended") {
+			targetStatus = "escalated"
+		} else {
+			targetStatus = reviewCase?.status || "open"
+		}
+
 		if (report.priority === "review-recommended" || forceKrill || reviewCase) {
 			reviewCase = await createReviewCase({
 				caseId,
 				guildId,
 				targetUserId,
-				status: reviewCase?.status || (report.priority === "review-recommended" ? "escalated" : "open"),
+				status: targetStatus,
 				heuristicScore: report.heuristicScore ?? 0,
 				concordance: report.concordance,
 				behavioralFamilies: JSON.stringify(Object.keys(report.familyScores)),

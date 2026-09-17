@@ -491,6 +491,7 @@ export const reviewCases = sqliteTable(
 		reviewMessageId: text("review_message_id"),
 		reviewChannelId: text("review_channel_id"),
 		deliveryStatus: text("delivery_status").notNull().default("pending"),
+		previousDeliveryStatus: text("previous_delivery_status").notNull().default("pending"),
 		cardRevision: integer("card_revision").notNull().default(1),
 		syncedCardRevision: integer("synced_card_revision").notNull().default(1),
 		expiresAt: text("expires_at"),

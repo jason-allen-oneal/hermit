@@ -12,7 +12,12 @@ import {
 	TextDisplay
 } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
-import { getReviewCase, updateReviewCase } from "../data/review.js"
+import {
+	getReviewCase,
+	markReviewCardSynced,
+	recordReviewCaseDecision,
+	updateReviewCase
+} from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
 import type { AnalysisReport, KrillEvaluation } from "../review/types.js"
 
@@ -133,7 +138,7 @@ export class ReviewDismissButton extends Button {
 		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
 		if (!caseId) return
 
-		const updated = await updateReviewCase(caseId, {
+		const updated = await recordReviewCaseDecision(caseId, {
 			status: "dismissed",
 			expiresAt: null,
 			decidedById: interaction.user?.id || interaction.userId,
@@ -145,16 +150,13 @@ export class ReviewDismissButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
-			if (interaction.message?.id !== updated.reviewMessageId) {
+			if (interaction.message?.id === updated.reviewMessageId) {
+				await markReviewCardSynced(caseId, updated.cardRevision)
+			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"
 				)
 				await syncSharedReviewCard(interaction.client, updated)
-			} else {
-				await updateReviewCase(caseId, {
-					cardRevision: (updated.cardRevision || 1) + 1,
-					syncedCardRevision: (updated.cardRevision || 1) + 1
-				})
 			}
 		}
 	}
@@ -187,7 +189,7 @@ export class ReviewWatchlistButton extends Button {
 		if (!caseId) return
 
 		const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString()
-		const updated = await updateReviewCase(caseId, {
+		const updated = await recordReviewCaseDecision(caseId, {
 			status: "watchlist",
 			expiresAt,
 			decidedById: interaction.user?.id || interaction.userId,
@@ -199,16 +201,13 @@ export class ReviewWatchlistButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
-			if (interaction.message?.id !== updated.reviewMessageId) {
+			if (interaction.message?.id === updated.reviewMessageId) {
+				await markReviewCardSynced(caseId, updated.cardRevision)
+			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"
 				)
 				await syncSharedReviewCard(interaction.client, updated)
-			} else {
-				await updateReviewCase(caseId, {
-					cardRevision: (updated.cardRevision || 1) + 1,
-					syncedCardRevision: (updated.cardRevision || 1) + 1
-				})
 			}
 		}
 	}
@@ -240,7 +239,7 @@ export class ReviewConfirmBotButton extends Button {
 		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
 		if (!caseId) return
 
-		const updated = await updateReviewCase(caseId, {
+		const updated = await recordReviewCaseDecision(caseId, {
 			status: "confirmed_bot",
 			expiresAt: null,
 			decidedById: interaction.user?.id || interaction.userId,
@@ -252,16 +251,13 @@ export class ReviewConfirmBotButton extends Button {
 			await interaction.update({
 				components: [container]
 			})
-			if (interaction.message?.id !== updated.reviewMessageId) {
+			if (interaction.message?.id === updated.reviewMessageId) {
+				await markReviewCardSynced(caseId, updated.cardRevision)
+			} else {
 				const { syncSharedReviewCard } = await import(
 					"../services/reviewNotifier.js"
 				)
 				await syncSharedReviewCard(interaction.client, updated)
-			} else {
-				await updateReviewCase(caseId, {
-					cardRevision: (updated.cardRevision || 1) + 1,
-					syncedCardRevision: (updated.cardRevision || 1) + 1
-				})
 			}
 		}
 	}

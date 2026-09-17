@@ -1,7 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
+import { describe, expect, it, beforeEach, afterEach, spyOn, mock } from "bun:test"
 import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import path from "node:path"
+import { SqliteD1Database } from "./helpers/sqliteD1.js"
+import { setRuntimeEnv } from "../src/runtime/env.js"
 import { Container, TextDisplay } from "@buape/carbon"
 import { contentFeatures, conversationalText } from "../src/review/features.js"
 import { timingSignals } from "../src/review/timing.js"
@@ -401,15 +403,15 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			let updateCaseArgs: any = null
 			let updatedMessagePayload: any = null
 
-			spyOn(reviewData, "updateReviewCase").mockImplementation(
-				async (caseId, update) => {
-					updateCaseArgs = { caseId, update }
+			spyOn(reviewData, "recordReviewCaseDecision").mockImplementation(
+				async (caseId, decision) => {
+					updateCaseArgs = { caseId, update: decision }
 					return {
 						id: 1,
 						caseId,
 						guildId: reviewConfig.guildId,
 						targetUserId: "target-1",
-						status: "dismissed",
+						status: decision.status,
 						heuristicScore: 70,
 						concordance: "High",
 						behavioralFamilies: "[]",
@@ -420,9 +422,12 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 						reviewMessageId: null,
 						reviewChannelId: null,
 						deliveryStatus: "delivered",
+						previousDeliveryStatus: "pending",
+						cardRevision: 2,
+						syncedCardRevision: 1,
 						expiresAt: null,
 						decidedById: "staff-1",
-						decisionReason: "Marked as human / dismissed by staff.",
+						decisionReason: decision.decisionReason,
 						createdAt: new Date().toISOString(),
 						updatedAt: new Date().toISOString()
 					}
@@ -451,15 +456,15 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			const watchlist = new ReviewWatchlistButton("case-202")
 			let updateCaseArgs: any = null
 
-			spyOn(reviewData, "updateReviewCase").mockImplementation(
-				async (caseId, update) => {
-					updateCaseArgs = { caseId, update }
+			spyOn(reviewData, "recordReviewCaseDecision").mockImplementation(
+				async (caseId, decision) => {
+					updateCaseArgs = { caseId, update: decision }
 					return {
 						id: 2,
 						caseId,
 						guildId: reviewConfig.guildId,
 						targetUserId: "target-2",
-						status: "watchlist",
+						status: decision.status,
 						heuristicScore: 75,
 						concordance: "High",
 						behavioralFamilies: "[]",
@@ -470,9 +475,12 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 						reviewMessageId: null,
 						reviewChannelId: null,
 						deliveryStatus: "delivered",
-						expiresAt: update.expiresAt ?? null,
+						previousDeliveryStatus: "pending",
+						cardRevision: 2,
+						syncedCardRevision: 1,
+						expiresAt: decision.expiresAt ?? null,
 						decidedById: "staff-1",
-						decisionReason: "Added to watchlist for 7 days.",
+						decisionReason: decision.decisionReason,
 						createdAt: new Date().toISOString(),
 						updatedAt: new Date().toISOString()
 					}
@@ -500,7 +508,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			let patchedMessageRoute: string | null = null
 			let patchedPayload: any = null
 
-			spyOn(reviewData, "updateReviewCase").mockResolvedValue({
+			const mockCase = {
 				id: 3,
 				caseId: "case-303",
 				guildId: reviewConfig.guildId,
@@ -516,12 +524,18 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewMessageId: "shared-channel-msg-999",
 				reviewChannelId: reviewConfig.reviewChannelId,
 				deliveryStatus: "delivered",
+				previousDeliveryStatus: "pending",
+				cardRevision: 2,
+				syncedCardRevision: 1,
 				expiresAt: null,
 				decidedById: "staff-1",
 				decisionReason: "Confirmed automated agent account.",
 				createdAt: new Date().toISOString(),
 				updatedAt: new Date().toISOString()
-			})
+			}
+			spyOn(reviewData, "recordReviewCaseDecision").mockResolvedValue(mockCase)
+			spyOn(reviewData, "getReviewCase").mockResolvedValue(mockCase)
+			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(mockCase)
 
 			const mockInteraction = {
 				member: { roles: [{ id: staffRoleId }] },
@@ -743,6 +757,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					reviewMessageId: null,
 					reviewChannelId: reviewConfig.reviewChannelId,
 					deliveryStatus: "uncertain",
+					previousDeliveryStatus: "uncertain",
 					cardRevision: 1,
 					syncedCardRevision: 1,
 					expiresAt: null,
@@ -807,6 +822,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					reviewMessageId: null,
 					reviewChannelId: reviewConfig.reviewChannelId,
 					deliveryStatus: "uncertain",
+					previousDeliveryStatus: "uncertain",
 					cardRevision: 1,
 					syncedCardRevision: 1,
 					expiresAt: null,
@@ -869,6 +885,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewMessageId: "existing-watchlist-card-msg",
 				reviewChannelId: reviewConfig.reviewChannelId,
 				deliveryStatus: "delivered",
+				previousDeliveryStatus: "pending",
 				cardRevision: 2,
 				syncedCardRevision: 2,
 				expiresAt: null,
@@ -879,6 +896,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			}
 
 			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "getReviewCase").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(watchlistReEscalatedCase)
 			spyOn(reviewData, "updateReviewCase").mockResolvedValue(null as any)
 
 			const mockClient = {
@@ -920,6 +939,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewMessageId: "shared-card-msg-1",
 				reviewChannelId: reviewConfig.reviewChannelId,
 				deliveryStatus: "delivered",
+				previousDeliveryStatus: "pending",
 				cardRevision: 3,
 				syncedCardRevision: 2,
 				expiresAt: null,
@@ -930,12 +950,11 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			}
 
 			spyOn(reviewData, "listOutOfSyncCases").mockResolvedValue([outOfSyncCase])
-			let updatedSyncedRevision: number | undefined
-			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-				if (update.syncedCardRevision !== undefined) {
-					updatedSyncedRevision = update.syncedCardRevision
-				}
-				return null
+			spyOn(reviewData, "getReviewCase").mockResolvedValue(outOfSyncCase)
+			let syncedRevisionMarked: number | undefined
+			spyOn(reviewData, "markReviewCardSynced").mockImplementation(async (caseId, rev) => {
+				syncedRevisionMarked = rev
+				return outOfSyncCase
 			})
 
 			const mockClient = {
@@ -949,7 +968,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 
 			await recoverSharedCardSync(mockClient)
 			expect(patchCalled).toBe(true)
-			expect(updatedSyncedRevision).toBe(4) // incremented cardRevision synced
+			expect(syncedRevisionMarked).toBe(3) // synced the rendered revision 3
 		})
 
 		it("aborts delivery immediately if case is no longer escalated", async () => {
@@ -1050,6 +1069,200 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			expect(reviewCase.delivery_status).toBe("pending")
 
 			db.close()
+		})
+	})
+
+	describe("Real D1 Database & Atomic Delivery Lifecycle", () => {
+		let d1Owner: SqliteD1Database
+		const origClientId = process.env.DISCORD_CLIENT_ID
+
+		beforeEach(() => {
+			mock.restore()
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			d1Owner = new SqliteD1Database()
+			const drizzleDir = path.join(__dirname, "../drizzle")
+			const files = fs
+				.readdirSync(drizzleDir)
+				.filter((f) => f.endsWith(".sql"))
+				.sort()
+			for (const file of files) {
+				const sql = fs.readFileSync(path.join(drizzleDir, file), "utf-8")
+				for (const stmt of sql.split("--> statement-breakpoint")) {
+					const clean = stmt.trim()
+					if (clean) d1Owner.database.run(clean)
+				}
+			}
+			setRuntimeEnv({ DB: d1Owner as unknown as D1Database } as any)
+		})
+
+		afterEach(() => {
+			mock.restore()
+			d1Owner?.close()
+			if (origClientId !== undefined) {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			} else {
+				delete process.env.DISCORD_CLIENT_ID
+			}
+		})
+
+		it("preserves uncertain delivery state across real atomic claim and prevents duplicate send on empty history", async () => {
+			const origClientId = process.env.DISCORD_CLIENT_ID
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			try {
+				await reviewData.createReviewCase({
+					caseId: "case-d1-uncertain",
+					guildId: reviewConfig.guildId,
+					targetUserId: "user-d1-1",
+					status: "escalated",
+					heuristicScore: 90,
+					concordance: "High",
+					behavioralFamilies: "[]",
+					deliveryStatus: "uncertain"
+				})
+
+				const dbCase = (await reviewData.getReviewCase("case-d1-uncertain"))!
+
+				let postCount = 0
+				const mockClient = {
+					rest: {
+						get: async () => [], // Inconclusive / empty history
+						post: async () => {
+							postCount++
+							return { id: "should-not-post" }
+						}
+					}
+				} as unknown as any
+
+				await postReviewEscalationCard(mockClient, dbCase, null, null)
+
+				// Uncertainty preserved; no duplicate send
+				expect(postCount).toBe(0)
+				const inDb = await reviewData.getReviewCase("case-d1-uncertain")
+				expect(inDb!.deliveryStatus).toBe("uncertain")
+				expect(inDb!.previousDeliveryStatus).toBe("uncertain")
+			} finally {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			}
+		})
+
+		it("treats stale delivering claim conservatively as uncertain and reconciles existing card", async () => {
+			const origClientId = process.env.DISCORD_CLIENT_ID
+			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
+			try {
+				// Insert a case with deliveryStatus: 'delivering' and stale updatedAt
+				const staleTime = new Date(Date.now() - 180_000).toISOString()
+				d1Owner.database.run(
+					`INSERT INTO review_cases (case_id, guild_id, target_user_id, status, heuristic_score, concordance, behavioral_families, delivery_status, previous_delivery_status, updated_at)
+					 VALUES ('case-d1-stale', ?, 'user-d1-2', 'escalated', 95, 'High', '[]', 'delivering', 'pending', ?)`,
+					[reviewConfig.guildId, staleTime]
+				)
+
+				const dbCase = (await reviewData.getReviewCase("case-d1-stale"))!
+
+				let postCount = 0
+				const mockClient = {
+					rest: {
+						get: async () => [
+							{
+								id: "found-card-msg-123",
+								author: { id: "bot-hermit-1", bot: true },
+								components: [{ content: `caseId=case-d1-stale\nuser-d1-2` }]
+							}
+						],
+						post: async () => {
+							postCount++
+							return { id: "unexpected" }
+						}
+					}
+				} as unknown as any
+
+				await postReviewEscalationCard(mockClient, dbCase, null, null)
+
+				expect(postCount).toBe(0)
+				const inDb = await reviewData.getReviewCase("case-d1-stale")
+				expect(inDb!.deliveryStatus).toBe("delivered")
+				expect(inDb!.reviewMessageId).toBe("found-card-msg-123")
+			} finally {
+				process.env.DISCORD_CLIENT_ID = origClientId
+			}
+		})
+
+		it("rejects stale card writes using monotonic persisted revisions", async () => {
+			await reviewData.createReviewCase({
+				caseId: "case-d1-revisions",
+				guildId: reviewConfig.guildId,
+				targetUserId: "user-d1-3",
+				status: "escalated",
+				heuristicScore: 80,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				cardRevision: 2,
+				syncedCardRevision: 1
+			})
+
+			// Concurrent action updates desired cardRevision to 3
+			await reviewData.updateReviewCase("case-d1-revisions", { cardRevision: 3 })
+
+			// A delayed older sync completes for revision 2
+			const staleResult = await reviewData.markReviewCardSynced("case-d1-revisions", 2)
+			expect(staleResult).toBeNull() // Rejected because cardRevision is already 3
+
+			const inDb = await reviewData.getReviewCase("case-d1-revisions")
+			expect(inDb!.syncedCardRevision).toBe(1) // Stale write did not overwrite syncedCardRevision!
+
+			// Newer sync completes for revision 3
+			const freshResult = await reviewData.markReviewCardSynced("case-d1-revisions", 3)
+			expect(freshResult).not.toBeNull()
+			expect(freshResult!.syncedCardRevision).toBe(3)
+		})
+
+		it("promotes existing open cases when manual review reaches review-recommended", async () => {
+			// Existing open case created previously
+			await reviewData.createReviewCase({
+				caseId: `case-${reviewConfig.guildId}-open-target`,
+				guildId: reviewConfig.guildId,
+				targetUserId: "open-target",
+				status: "open",
+				heuristicScore: 40,
+				concordance: "Low",
+				behavioralFamilies: "[]"
+			})
+
+			const cmd = new ReviewCommand()
+			const staffRoleId = reviewConfig.staffRoleIds[0]
+
+			const mockInteraction = {
+				guild: { id: reviewConfig.guildId },
+				member: { roles: [{ id: staffRoleId }] },
+				options: {
+					getUser: () => ({ id: "open-target" }),
+					getBoolean: () => false
+				},
+				reply: async () => {}
+			} as unknown as any
+
+			// Add automated observations for open-target to trigger review-recommended (10 messages over >60s)
+			const now = Date.now()
+			for (let i = 0; i < 10; i++) {
+				await reviewData.recordObservation({
+					messageId: `obs-promo-${i}`,
+					guildId: reviewConfig.guildId,
+					channelId: "chan-1",
+					authorId: "open-target",
+					createdAt: new Date(now - (10 - i) * 8000).toISOString(),
+					contentLength: 300,
+					lineCount: 10,
+					fingerprint: "fp",
+					artifacts: JSON.stringify(["execution-marker", "ai-formatting"]),
+					replyToId: i > 0 ? `obs-promo-${i - 1}` : null
+				})
+			}
+
+			await cmd.run(mockInteraction)
+
+			const inDb = await reviewData.getReviewCase(`case-${reviewConfig.guildId}-open-target`)
+			expect(inDb!.status).toBe("escalated")
+			expect(inDb!.deliveryStatus).toBe("pending") // Ready for delivery recovery!
 		})
 	})
 })
