@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "793d4b1d-494e-40d0-85a7-cc0f143a5fd8",
+  "id": "7b092a3e-2125-4013-999e-e32da449f6a3",
   "prevId": "30731fe5-aff9-413c-b7c6-cbe4ac734ebc",
   "tables": {
     "action_cooldown_events": {
@@ -1660,6 +1660,21 @@
         },
         "review_channel_id": {
           "name": "review_channel_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "delivery_status": {
+          "name": "delivery_status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'pending'"
+        },
+        "expires_at": {
+          "name": "expires_at",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

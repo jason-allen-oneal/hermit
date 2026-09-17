@@ -13,6 +13,8 @@ CREATE TABLE `review_cases` (
 	`krill_model` text,
 	`review_message_id` text,
 	`review_channel_id` text,
+	`delivery_status` text DEFAULT 'pending' NOT NULL,
+	`expires_at` text,
 	`decided_by_id` text,
 	`decision_reason` text,
 	`created_at` text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,

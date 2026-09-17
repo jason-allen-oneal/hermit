@@ -1,9 +1,20 @@
-import { describe, expect, it, beforeEach, afterEach } from "bun:test"
+import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
+import { Container, TextDisplay } from "@buape/carbon"
 import { contentFeatures, conversationalText } from "../src/review/features.js"
 import { timingSignals } from "../src/review/timing.js"
 import { analyze } from "../src/review/analyzer.js"
 import { evaluateWithKrill } from "../src/review/krillEvaluator.js"
-import { buildReviewCardContainer } from "../src/components/reviewButtons.js"
+import {
+	ReviewDismissButton,
+	ReviewWatchlistButton,
+	ReviewConfirmBotButton,
+	buildReviewCardContainer
+} from "../src/components/reviewButtons.js"
+import ReviewCommand from "../src/commands/review.js"
+import { reviewConfig } from "../src/config/review.js"
+import * as reviewData from "../src/data/review.js"
+import { postReviewEscalationCard } from "../src/services/reviewNotifier.js"
+import ReviewIngestMessageCreate from "../src/events/reviewIngestMessageCreate.js"
 import type { ReviewCase } from "../src/db/schema.js"
 import type { AnalysisReport, ReviewMessage } from "../src/review/types.js"
 
@@ -293,6 +304,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				krillModel: "gpt-6-astra",
 				reviewMessageId: null,
 				reviewChannelId: "1519064274561929328",
+				deliveryStatus: "pending",
+				expiresAt: null,
 				decidedById: null,
 				decisionReason: null,
 				createdAt: new Date().toISOString(),
@@ -302,6 +315,349 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			const container = buildReviewCardContainer(reviewCase, null, null, false)
 			expect(container).toBeDefined()
 			expect(container.components.length).toBeGreaterThan(3)
+		})
+
+		it("displays watchlist expiration timestamp when on watchlist", () => {
+			const expires = new Date(Date.now() + 7 * 86400000).toISOString()
+			const reviewCase: ReviewCase = {
+				id: 2,
+				caseId: "case-g1-u2",
+				guildId: "g1",
+				targetUserId: "u2",
+				status: "watchlist",
+				heuristicScore: 80,
+				concordance: "High",
+				behavioralFamilies: JSON.stringify(["timing"]),
+				evidenceMessageId: "m2",
+				krillProbability: "85%",
+				krillBrief: "Watchlist evaluation.",
+				krillModel: "gpt-6-astra",
+				reviewMessageId: "msg-1",
+				reviewChannelId: "1519064274561929328",
+				deliveryStatus: "delivered",
+				expiresAt: expires,
+				decidedById: "staff-1",
+				decisionReason: "Added to watchlist for 7 days.",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			const container = buildReviewCardContainer(reviewCase, null, null, true)
+			const statusDisplay = container.components.find(
+				(c) => c instanceof TextDisplay && (c as any).content?.includes("WATCHLIST")
+			)
+			expect(statusDisplay).toBeDefined()
+		})
+	})
+
+	describe("Review Buttons Dispatch & Routing (reviewButtons.ts)", () => {
+		const staffRoleId = reviewConfig.staffRoleIds[0]
+
+		it("configures distinct customIds and defer=false across all actions", () => {
+			const dismiss = new ReviewDismissButton("case-101")
+			const watchlist = new ReviewWatchlistButton("case-101")
+			const confirmBot = new ReviewConfirmBotButton("case-101")
+
+			expect(dismiss.customId).toBe("review-dismiss:caseId=case-101")
+			expect(dismiss.defer).toBe(false)
+
+			expect(watchlist.customId).toBe("review-watchlist:caseId=case-101")
+			expect(watchlist.defer).toBe(false)
+
+			expect(confirmBot.customId).toBe("review-confirm-bot:caseId=case-101")
+			expect(confirmBot.defer).toBe(false)
+		})
+
+		it("rejects non-staff interactions with Carbon Container notice", async () => {
+			const dismiss = new ReviewDismissButton("case-101")
+			let repliedPayload: any = null
+
+			const mockInteraction = {
+				member: { roles: [{ id: "unrelated-role" }] },
+				user: { id: "non-staff-user" },
+				userId: "non-staff-user",
+				reply: async (payload: any) => {
+					repliedPayload = payload
+				}
+			} as unknown as any
+
+			await dismiss.run(mockInteraction, { caseId: "case-101" })
+
+			expect(repliedPayload).toBeDefined()
+			expect(repliedPayload.ephemeral).toBe(true)
+			expect(repliedPayload.components[0] instanceof Container).toBe(true)
+			expect(repliedPayload.components[0].accentColor).toBe("#f85149")
+		})
+
+		it("dismisses case for staff and updates card without deferring", async () => {
+			const dismiss = new ReviewDismissButton("case-101")
+			let updateCaseArgs: any = null
+			let updatedMessagePayload: any = null
+
+			spyOn(reviewData, "updateReviewCase").mockImplementation(
+				async (caseId, update) => {
+					updateCaseArgs = { caseId, update }
+					return {
+						id: 1,
+						caseId,
+						guildId: reviewConfig.guildId,
+						targetUserId: "target-1",
+						status: "dismissed",
+						heuristicScore: 70,
+						concordance: "High",
+						behavioralFamilies: "[]",
+						evidenceMessageId: null,
+						krillProbability: null,
+						krillBrief: null,
+						krillModel: null,
+						reviewMessageId: null,
+						reviewChannelId: null,
+						deliveryStatus: "delivered",
+						expiresAt: null,
+						decidedById: "staff-1",
+						decisionReason: "Marked as human / dismissed by staff.",
+						createdAt: new Date().toISOString(),
+						updatedAt: new Date().toISOString()
+					}
+				}
+			)
+
+			const mockInteraction = {
+				member: { roles: [{ id: staffRoleId }] },
+				user: { id: "staff-1" },
+				userId: "staff-1",
+				update: async (payload: any) => {
+					updatedMessagePayload = payload
+				}
+			} as unknown as any
+
+			await dismiss.run(mockInteraction, { caseId: "case-101" })
+
+			expect(updateCaseArgs.caseId).toBe("case-101")
+			expect(updateCaseArgs.update.status).toBe("dismissed")
+			expect(updateCaseArgs.update.expiresAt).toBeNull()
+			expect(updatedMessagePayload).toBeDefined()
+			expect(updatedMessagePayload.components[0] instanceof Container).toBe(true)
+		})
+
+		it("places case on 7-day watchlist with expiration timestamp", async () => {
+			const watchlist = new ReviewWatchlistButton("case-202")
+			let updateCaseArgs: any = null
+
+			spyOn(reviewData, "updateReviewCase").mockImplementation(
+				async (caseId, update) => {
+					updateCaseArgs = { caseId, update }
+					return {
+						id: 2,
+						caseId,
+						guildId: reviewConfig.guildId,
+						targetUserId: "target-2",
+						status: "watchlist",
+						heuristicScore: 75,
+						concordance: "High",
+						behavioralFamilies: "[]",
+						evidenceMessageId: null,
+						krillProbability: null,
+						krillBrief: null,
+						krillModel: null,
+						reviewMessageId: null,
+						reviewChannelId: null,
+						deliveryStatus: "delivered",
+						expiresAt: update.expiresAt ?? null,
+						decidedById: "staff-1",
+						decisionReason: "Added to watchlist for 7 days.",
+						createdAt: new Date().toISOString(),
+						updatedAt: new Date().toISOString()
+					}
+				}
+			)
+
+			const mockInteraction = {
+				member: { roles: [{ id: staffRoleId }] },
+				user: { id: "staff-1" },
+				userId: "staff-1",
+				update: async () => {}
+			} as unknown as any
+
+			await watchlist.run(mockInteraction, { caseId: "case-202" })
+
+			expect(updateCaseArgs.caseId).toBe("case-202")
+			expect(updateCaseArgs.update.status).toBe("watchlist")
+			expect(updateCaseArgs.update.expiresAt).toBeDefined()
+			const expiresDate = new Date(updateCaseArgs.update.expiresAt).getTime()
+			expect(expiresDate).toBeGreaterThan(Date.now() + 6 * 86400000)
+		})
+	})
+
+	describe("Review Command (review.ts)", () => {
+		const staffRoleId = reviewConfig.staffRoleIds[0]
+
+		it("reads user option via getUser and enforces community guild boundary", async () => {
+			const cmd = new ReviewCommand()
+			let getUserCalled = false
+			let repliedPayload: any = null
+
+			const mockInteractionForeignGuild = {
+				guild: { id: "foreign-guild-123" },
+				member: { roles: [{ id: staffRoleId }] },
+				options: {
+					getUser: () => {
+						getUserCalled = true
+						return { id: "target-user-1" }
+					},
+					getBoolean: () => false
+				},
+				reply: async (payload: any) => {
+					repliedPayload = payload
+				}
+			} as unknown as any
+
+			await cmd.run(mockInteractionForeignGuild)
+
+			expect(getUserCalled).toBe(false)
+			expect(repliedPayload).toBeDefined()
+			expect(repliedPayload.components[0] instanceof Container).toBe(true)
+			expect(repliedPayload.components[0].accentColor).toBe("#f85149")
+		})
+	})
+
+	describe("Guild Boundary & Periodic Trigger (reviewIngestMessageCreate.ts)", () => {
+		it("drops foreign guild messages immediately without recording observations", async () => {
+			const listener = new ReviewIngestMessageCreate()
+			let recordCalled = false
+
+			spyOn(reviewData, "recordObservation").mockImplementation(async () => {
+				recordCalled = true
+				return null
+			})
+
+			await listener.handle(
+				{
+					id: "msg-foreign-1",
+					guild_id: "other-guild-999",
+					channel_id: "channel-1",
+					author: { id: "user-1" },
+					content: "normal message",
+					timestamp: new Date().toISOString()
+				} as any,
+				{} as any
+			)
+
+			expect(recordCalled).toBe(false)
+		})
+
+		it("triggers evaluation on periodic count (every 10 messages) without tool markers", async () => {
+			const listener = new ReviewIngestMessageCreate()
+			let evaluatedReport = false
+
+			spyOn(reviewData, "recordObservation").mockImplementation(async (obs) => {
+				return { ...obs, id: 10, artifacts: "[]", similarity: null, semanticScore: null, receivedAt: new Date().toISOString() }
+			})
+
+			spyOn(reviewData, "getUserObservationCount").mockResolvedValue(10)
+			spyOn(reviewData, "getReviewCase").mockResolvedValue(null)
+			spyOn(reviewData, "getRecentUserObservations").mockImplementation(async () => {
+				evaluatedReport = true
+				return []
+			})
+
+			await listener.handle(
+				{
+					id: "msg-comm-10",
+					guild_id: reviewConfig.guildId,
+					channel_id: "channel-1",
+					author: { id: "user-stylometry-only" },
+					content: "normal message with no tool markers at all",
+					timestamp: new Date().toISOString()
+				} as any,
+				{} as any
+			)
+
+			expect(evaluatedReport).toBe(true)
+		})
+	})
+
+	describe("Review Notifier & Recovery (reviewNotifier.ts)", () => {
+		it("strictly rejects posting escalation cards for foreign guilds", async () => {
+			let postCalled = false
+			const mockClient = {
+				rest: {
+					post: async () => {
+						postCalled = true
+						return { id: "discord-msg-1" }
+					}
+				}
+			} as unknown as any
+
+			const foreignCase: ReviewCase = {
+				id: 99,
+				caseId: "case-foreign-1",
+				guildId: "foreign-guild-999",
+				targetUserId: "u1",
+				status: "escalated",
+				heuristicScore: 90,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: null,
+				krillBrief: null,
+				krillModel: null,
+				reviewMessageId: null,
+				reviewChannelId: null,
+				deliveryStatus: "pending",
+				expiresAt: null,
+				decidedById: null,
+				decisionReason: null,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			await postReviewEscalationCard(mockClient, foreignCase, null, null)
+			expect(postCalled).toBe(false)
+		})
+
+		it("claims delivery atomically and marks deliveryStatus=failed on error", async () => {
+			let updatedStatus: string | null = null
+
+			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(true)
+			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
+				if (update.deliveryStatus) updatedStatus = update.deliveryStatus
+				return null
+			})
+
+			const mockClient = {
+				rest: {
+					post: async () => {
+						throw new Error("Discord API 500 Internal Error")
+					}
+				}
+			} as unknown as any
+
+			const validCase: ReviewCase = {
+				id: 1,
+				caseId: "case-valid-1",
+				guildId: reviewConfig.guildId,
+				targetUserId: "u1",
+				status: "escalated",
+				heuristicScore: 90,
+				concordance: "High",
+				behavioralFamilies: "[]",
+				evidenceMessageId: null,
+				krillProbability: null,
+				krillBrief: null,
+				krillModel: null,
+				reviewMessageId: null,
+				reviewChannelId: null,
+				deliveryStatus: "pending",
+				expiresAt: null,
+				decidedById: null,
+				decisionReason: null,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			}
+
+			await postReviewEscalationCard(mockClient, validCase, null, null)
+			expect(updatedStatus).toBe("failed")
 		})
 	})
 })

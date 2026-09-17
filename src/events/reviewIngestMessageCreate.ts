@@ -4,7 +4,13 @@ import {
 	MessageCreateListener
 } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
-import { recordObservation, getRecentUserObservations, createReviewCase, getReviewCase } from "../data/review.js"
+import {
+	recordObservation,
+	getRecentUserObservations,
+	createReviewCase,
+	getReviewCase,
+	getUserObservationCount
+} from "../data/review.js"
 import { contentFeatures } from "../review/features.js"
 import { analyze } from "../review/analyzer.js"
 import { evaluateWithKrill } from "../review/krillEvaluator.js"
@@ -15,7 +21,13 @@ const getSecretKey = () =>
 
 export default class ReviewIngestMessageCreate extends MessageCreateListener {
 	async handle(data: ListenerEventData[this["type"]], client: Client) {
-		if (!data.guild_id || !data.channel_id || data.webhook_id) {
+		// Strictly enforce the community server guild boundary before ingestion or evaluation
+		if (
+			!data.guild_id ||
+			data.guild_id !== reviewConfig.guildId ||
+			!data.channel_id ||
+			data.webhook_id
+		) {
 			return
 		}
 		if (!data.content && (!data.attachments || data.attachments.length === 0)) {
@@ -50,12 +62,33 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 				artifacts: JSON.stringify(features.artifacts)
 			})
 
-			// If strong operational/thought markers appear, check if account meets escalation threshold
+			// Check evaluation eligibility:
+			// 1. Immediately if operational/tool markers appear (e.g. tool execution, thought tags)
+			// 2. Periodically every 10 messages so pure timing + repetition/stylometry combinations evaluate without tool markers
 			const hasCriticalMarker =
 				features.artifacts.includes("execution-marker") ||
 				features.artifacts.includes("tool-envelope")
 
-			if (hasCriticalMarker) {
+			const obsCount = await getUserObservationCount(
+				data.guild_id,
+				data.author.id,
+				reviewConfig.windowDays
+			)
+			const isPeriodicCheck = obsCount >= 10 && obsCount % 10 === 0
+
+			if (hasCriticalMarker || isPeriodicCheck) {
+				const caseId = `case-${data.guild_id}-${data.author.id}`
+				const existing = await getReviewCase(caseId)
+				const isWatchlistExpired =
+					existing?.status === "watchlist" &&
+					existing.expiresAt &&
+					new Date(existing.expiresAt).getTime() <= Date.now()
+
+				// If already decided (dismissed / confirmed bot) or on active watchlist, skip automated re-escalation
+				if (existing && existing.status !== "open" && !isWatchlistExpired) {
+					return
+				}
+
 				const recent = await getRecentUserObservations(
 					data.guild_id,
 					data.author.id,
@@ -76,34 +109,35 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 					})
 
 					if (report.priority === "review-recommended") {
-						const caseId = `case-${data.guild_id}-${data.author.id}`
-						const existing = await getReviewCase(caseId)
-						if (!existing || existing.status === "open") {
-							// Evaluate with Krill (gpt-6-astra low-thinking)
-							const krill = await evaluateWithKrill(report)
+						// Evaluate with Krill (gpt-6-astra low-thinking)
+						const krill = await evaluateWithKrill(report)
 
-							const createdCase = await createReviewCase({
-								caseId,
-								guildId: data.guild_id,
-								targetUserId: data.author.id,
-								status: "escalated",
-								heuristicScore: report.heuristicScore ?? 0,
-								concordance: report.concordance,
-								behavioralFamilies: JSON.stringify(
-									Object.keys(report.familyScores)
-								),
-								evidenceMessageId: data.id,
-								krillProbability: krill
-									? `${(krill.automationProbability * 100).toFixed(1)}%`
-									: null,
-								krillBrief: krill?.brief ?? null,
-								krillModel: krill?.model ?? null,
-								reviewChannelId: reviewConfig.reviewChannelId
-							})
+						const createdCase = await createReviewCase({
+							caseId,
+							guildId: data.guild_id,
+							targetUserId: data.author.id,
+							status: "escalated",
+							deliveryStatus: "pending",
+							heuristicScore: report.heuristicScore ?? 0,
+							concordance: report.concordance,
+							behavioralFamilies: JSON.stringify(
+								Object.keys(report.familyScores)
+							),
+							evidenceMessageId: data.id,
+							krillProbability: krill
+								? `${(krill.automationProbability * 100).toFixed(1)}%`
+								: null,
+							krillBrief: krill?.brief ?? null,
+							krillModel: krill?.model ?? null,
+							reviewChannelId: reviewConfig.reviewChannelId
+						})
 
-							if (createdCase) {
-								await postReviewEscalationCard(client, createdCase, report, krill)
-							}
+						if (
+							createdCase &&
+							createdCase.status === "escalated" &&
+							createdCase.deliveryStatus === "pending"
+						) {
+							await postReviewEscalationCard(client, createdCase, report, krill)
 						}
 					}
 				}

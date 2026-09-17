@@ -104,6 +104,16 @@ export const createReviewCase = async (
 		.onConflictDoUpdate({
 			target: [reviewCases.caseId],
 			set: {
+				status: sql`CASE 
+					WHEN review_cases.status = 'open' THEN ${data.status}
+					WHEN review_cases.status = 'watchlist' AND review_cases.expires_at IS NOT NULL AND review_cases.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN ${data.status}
+					ELSE review_cases.status 
+				END`,
+				deliveryStatus: sql`CASE
+					WHEN review_cases.status = 'open' THEN ${data.deliveryStatus ?? "pending"}
+					WHEN review_cases.status = 'watchlist' AND review_cases.expires_at IS NOT NULL AND review_cases.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN 'pending'
+					ELSE review_cases.delivery_status
+				END`,
 				heuristicScore: data.heuristicScore,
 				concordance: data.concordance,
 				behavioralFamilies: data.behavioralFamilies,
@@ -111,6 +121,7 @@ export const createReviewCase = async (
 				krillProbability: data.krillProbability,
 				krillBrief: data.krillBrief,
 				krillModel: data.krillModel,
+				reviewChannelId: data.reviewChannelId,
 				updatedAt: now
 			}
 		})
@@ -145,4 +156,93 @@ export const updateReviewCase = async (
 		.returning()
 
 	return updated ?? null
+}
+
+export const claimReviewCaseDelivery = async (
+	caseId: string
+): Promise<boolean> => {
+	const [claimed] = await getDb()
+		.update(reviewCases)
+		.set({
+			deliveryStatus: "delivering",
+			updatedAt: now
+		})
+		.where(
+			and(
+				eq(reviewCases.caseId, caseId),
+				inArray(reviewCases.deliveryStatus, ["pending", "failed"])
+			)
+		)
+		.returning()
+
+	return Boolean(claimed)
+}
+
+export const getUndeliveredEscalations = async (
+	guildId: string,
+	limit = 10
+): Promise<ReviewCase[]> => {
+	return getDb()
+		.select()
+		.from(reviewCases)
+		.where(
+			and(
+				eq(reviewCases.guildId, guildId),
+				eq(reviewCases.status, "escalated"),
+				inArray(reviewCases.deliveryStatus, ["pending", "failed"])
+			)
+		)
+		.limit(limit)
+}
+
+export const expireWatchlistCases = async (): Promise<number> => {
+	const expired = await getDb()
+		.update(reviewCases)
+		.set({
+			status: "open",
+			expiresAt: null,
+			decisionReason: "Watchlist monitoring period expired; eligible for re-evaluation.",
+			updatedAt: now
+		})
+		.where(
+			and(
+				eq(reviewCases.status, "watchlist"),
+				sql`expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
+			)
+		)
+		.returning()
+
+	return expired.length
+}
+
+export const pruneOldObservations = async (
+	retentionDays = 14
+): Promise<number> => {
+	const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()
+	const deleted = await getDb()
+		.delete(reviewObservations)
+		.where(sql`created_at < ${cutoff}`)
+		.returning()
+
+	return deleted.length
+}
+
+export const getUserObservationCount = async (
+	guildId: string,
+	authorId: string,
+	windowDays = 7
+): Promise<number> => {
+	const cutoff = new Date(Date.now() - windowDays * 86400000).toISOString()
+	const [result] = await getDb()
+		.select({ count: sql<number>`count(*)` })
+		.from(reviewObservations)
+		.where(
+			and(
+				eq(reviewObservations.guildId, guildId),
+				eq(reviewObservations.authorId, authorId),
+				gte(reviewObservations.createdAt, cutoff)
+			)
+		)
+
+	return result?.count ?? 0
 }

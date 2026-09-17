@@ -490,6 +490,8 @@ export const reviewCases = sqliteTable(
 		krillModel: text("krill_model"),
 		reviewMessageId: text("review_message_id"),
 		reviewChannelId: text("review_channel_id"),
+		deliveryStatus: text("delivery_status").notNull().default("pending"),
+		expiresAt: text("expires_at"),
 		decidedById: text("decided_by_id"),
 		decisionReason: text("decision_reason"),
 		createdAt: text("created_at")

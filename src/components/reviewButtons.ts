@@ -33,10 +33,15 @@ export const buildReviewCardContainer = (
 					? "#f1c40f"
 					: "#d29922"
 
+	const statusText =
+		reviewCase.status === "watchlist" && reviewCase.expiresAt
+			? `WATCHLIST (expires <t:${Math.floor(new Date(reviewCase.expiresAt).getTime() / 1000)}:R>)`
+			: reviewCase.status.toUpperCase()
+
 	const lines: (TextDisplay | Separator | Row<Button>)[] = [
 		new TextDisplay("### 🦞 Claw & Order | Automation Review"),
 		new TextDisplay(
-			`**Target Account:** <@${reviewCase.targetUserId}>\n**Status:** ${reviewCase.status.toUpperCase()}`
+			`**Target Account:** <@${reviewCase.targetUserId}>\n**Status:** ${statusText}`
 		),
 		new Separator({ divider: true, spacing: "small" }),
 		new TextDisplay(
@@ -90,34 +95,44 @@ export const buildReviewCardContainer = (
 	return new Container(lines, { accentColor })
 }
 
+const buildPermissionDeniedContainer = () =>
+	new Container(
+		[
+			new TextDisplay("### Permission required"),
+			new TextDisplay("Community Team or Maintainer role required.")
+		],
+		{ accentColor: "#f85149" }
+	)
+
 export class ReviewDismissButton extends Button {
-	customId = "review:dismiss"
+	customId = "review-dismiss"
 	label = "Dismiss (Human)"
 	style = ButtonStyle.Secondary
 	ephemeral = true
-	defer = true
+	defer = false
 
 	constructor(caseId?: string) {
 		super()
 		if (caseId) {
-			this.customId = `review:dismiss:${caseId}`
+			this.customId = `review-dismiss:caseId=${caseId}`
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
 		if (!hasStaffRole(interaction)) {
 			await interaction.reply({
-				content: "Community Team or Maintainer role required.",
+				components: [buildPermissionDeniedContainer()],
 				ephemeral: true
 			})
 			return
 		}
 
-		const caseId = String(data.custom_id).split(":")[2]
+		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
 		if (!caseId) return
 
 		const updated = await updateReviewCase(caseId, {
 			status: "dismissed",
+			expiresAt: null,
 			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Marked as human / dismissed by staff."
 		})
@@ -132,33 +147,35 @@ export class ReviewDismissButton extends Button {
 }
 
 export class ReviewWatchlistButton extends Button {
-	customId = "review:watchlist"
-	label = "Watchlist"
+	customId = "review-watchlist"
+	label = "Watchlist (7d)"
 	style = ButtonStyle.Primary
 	ephemeral = true
-	defer = true
+	defer = false
 
 	constructor(caseId?: string) {
 		super()
 		if (caseId) {
-			this.customId = `review:watchlist:${caseId}`
+			this.customId = `review-watchlist:caseId=${caseId}`
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
 		if (!hasStaffRole(interaction)) {
 			await interaction.reply({
-				content: "Community Team or Maintainer role required.",
+				components: [buildPermissionDeniedContainer()],
 				ephemeral: true
 			})
 			return
 		}
 
-		const caseId = String(data.custom_id).split(":")[2]
+		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
 		if (!caseId) return
 
+		const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString()
 		const updated = await updateReviewCase(caseId, {
 			status: "watchlist",
+			expiresAt,
 			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Added to watchlist for 7 days."
 		})
@@ -173,33 +190,34 @@ export class ReviewWatchlistButton extends Button {
 }
 
 export class ReviewConfirmBotButton extends Button {
-	customId = "review:confirm_bot"
+	customId = "review-confirm-bot"
 	label = "Confirm Bot"
 	style = ButtonStyle.Danger
 	ephemeral = true
-	defer = true
+	defer = false
 
 	constructor(caseId?: string) {
 		super()
 		if (caseId) {
-			this.customId = `review:confirm_bot:${caseId}`
+			this.customId = `review-confirm-bot:caseId=${caseId}`
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
 		if (!hasStaffRole(interaction)) {
 			await interaction.reply({
-				content: "Community Team or Maintainer role required.",
+				components: [buildPermissionDeniedContainer()],
 				ephemeral: true
 			})
 			return
 		}
 
-		const caseId = String(data.custom_id).split(":")[2]
+		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
 		if (!caseId) return
 
 		const updated = await updateReviewCase(caseId, {
 			status: "confirmed_bot",
+			expiresAt: null,
 			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Confirmed automated agent account."
 		})

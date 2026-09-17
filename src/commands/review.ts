@@ -73,15 +73,26 @@ export default class ReviewCommand extends BaseCommand {
 		}
 
 		const guildId = interaction.guild?.id
-		if (!guildId) {
+		if (!guildId || guildId !== reviewConfig.guildId) {
 			await interaction.reply({
-				content: "This command can only be used in a server.",
+				components: [
+					new Container(
+						[
+							new TextDisplay("### Invalid server"),
+							new TextDisplay(
+								"This command is only enabled for the primary community server."
+							)
+						],
+						{ accentColor: "#f85149" }
+					)
+				],
 				ephemeral: true
 			})
 			return
 		}
 
-		const targetUserId = interaction.options.getString("user", true)
+		const targetUser = interaction.options.getUser("user", true)
+		const targetUserId = targetUser.id
 		const forceKrill =
 			interaction.options.getBoolean("krill", false) ?? false
 
