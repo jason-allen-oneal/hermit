@@ -1,0 +1,20 @@
+export const reviewConfig = {
+	guildId: "1456350064065904867",
+	reviewChannelId: "1519064274561929328", // #ct-general
+	staffRoleIds: [
+		"1477360613125787678", // Community Team
+		"1457214688806047756"  // Maintainers
+	],
+	autoEscalate: {
+		minScore: 50,
+		minFamilies: 2
+	},
+	krill: {
+		model: "gpt-6-astra",
+		fallbackModel: "gpt-4.1-mini",
+		reasoningEffort: "low" as const,
+		timeoutMs: 15000
+	},
+	windowDays: 7,
+	maxObservationsPerSample: 100
+} as const
