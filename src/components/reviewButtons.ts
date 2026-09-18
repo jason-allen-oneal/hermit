@@ -2,22 +2,17 @@ import {
 	Button,
 	type ButtonInteraction,
 	ButtonStyle,
-	type Client,
 	type ComponentData,
 	Container,
-	Routes,
 	Row,
 	Separator,
-	serializePayload,
 	TextDisplay
 } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
 import {
-	getReviewCase,
 	markReviewCardStaleWrite,
 	markReviewCardSynced,
-	recordReviewCaseDecision,
-	updateReviewCase
+	recordReviewCaseDecision
 } from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
 import type { AnalysisReport, KrillEvaluation } from "../review/types.js"
@@ -101,6 +96,8 @@ export const buildReviewCardContainer = (
 		)
 	}
 
+	// This identity survives removal of all decision buttons.
+	lines.push(new TextDisplay(`-# hermit-review:v1:${reviewCase.caseId}`))
 	return new Container(lines, { accentColor })
 }
 
@@ -112,6 +109,50 @@ const buildPermissionDeniedContainer = () =>
 		],
 		{ accentColor: "#f85149" }
 	)
+
+const finishReviewDecision = async (
+	interaction: ButtonInteraction,
+	updated: ReviewCase
+): Promise<void> => {
+	const targetsSharedCard = Boolean(updated.reviewMessageId) &&
+		interaction.message?.id === updated.reviewMessageId
+	let needsSharedSync = true
+	const persistenceErrors: unknown[] = []
+	try {
+		await interaction.update({
+			components: [buildReviewCardContainer(updated, null, null, true)],
+			allowedMentions: { parse: [] }
+		})
+		if (targetsSharedCard) {
+			const synced = await markReviewCardSynced(updated.caseId, updated.cardRevision)
+			needsSharedSync = !synced
+			if (!synced) await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)
+		}
+	} catch (error) {
+		console.warn("Failed to update review decision interaction:", error)
+		if (targetsSharedCard) {
+			try {
+				await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)
+			} catch (persistenceError) {
+				persistenceErrors.push(persistenceError)
+			}
+		}
+	}
+
+	// An ephemeral success is not a shared-card acknowledgment, and an
+	// ephemeral failure must not prevent attempting the shared-card repair.
+	if (needsSharedSync) {
+		try {
+			const { syncSharedReviewCard } = await import("../services/reviewNotifier.js")
+			await syncSharedReviewCard(interaction.client, updated)
+		} catch (error) {
+			persistenceErrors.push(error)
+		}
+	}
+	if (persistenceErrors.length > 0) {
+		throw new AggregateError(persistenceErrors, "Failed to persist review card repair work")
+	}
+}
 
 export class ReviewDismissButton extends Button {
 	customId = "review-dismiss"
@@ -146,27 +187,7 @@ export class ReviewDismissButton extends Button {
 			decisionReason: "Marked as human / dismissed by staff."
 		})
 
-		if (updated) {
-			const container = buildReviewCardContainer(updated, null, null, true)
-			await interaction.update({
-				components: [container]
-			})
-			if (interaction.message?.id === updated.reviewMessageId) {
-				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
-				if (!synced) {
-					await markReviewCardStaleWrite(caseId, updated.cardRevision)
-					const { syncSharedReviewCard } = await import(
-						"../services/reviewNotifier.js"
-					)
-					await syncSharedReviewCard(interaction.client, updated)
-				}
-			} else {
-				const { syncSharedReviewCard } = await import(
-					"../services/reviewNotifier.js"
-				)
-				await syncSharedReviewCard(interaction.client, updated)
-			}
-		}
+		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 
@@ -204,27 +225,7 @@ export class ReviewWatchlistButton extends Button {
 			decisionReason: "Added to watchlist for 7 days."
 		})
 
-		if (updated) {
-			const container = buildReviewCardContainer(updated, null, null, true)
-			await interaction.update({
-				components: [container]
-			})
-			if (interaction.message?.id === updated.reviewMessageId) {
-				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
-				if (!synced) {
-					await markReviewCardStaleWrite(caseId, updated.cardRevision)
-					const { syncSharedReviewCard } = await import(
-						"../services/reviewNotifier.js"
-					)
-					await syncSharedReviewCard(interaction.client, updated)
-				}
-			} else {
-				const { syncSharedReviewCard } = await import(
-					"../services/reviewNotifier.js"
-				)
-				await syncSharedReviewCard(interaction.client, updated)
-			}
-		}
+		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 
@@ -261,27 +262,7 @@ export class ReviewConfirmBotButton extends Button {
 			decisionReason: "Confirmed automated agent account."
 		})
 
-		if (updated) {
-			const container = buildReviewCardContainer(updated, null, null, true)
-			await interaction.update({
-				components: [container]
-			})
-			if (interaction.message?.id === updated.reviewMessageId) {
-				const synced = await markReviewCardSynced(caseId, updated.cardRevision)
-				if (!synced) {
-					await markReviewCardStaleWrite(caseId, updated.cardRevision)
-					const { syncSharedReviewCard } = await import(
-						"../services/reviewNotifier.js"
-					)
-					await syncSharedReviewCard(interaction.client, updated)
-				}
-			} else {
-				const { syncSharedReviewCard } = await import(
-					"../services/reviewNotifier.js"
-				)
-				await syncSharedReviewCard(interaction.client, updated)
-			}
-		}
+		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 

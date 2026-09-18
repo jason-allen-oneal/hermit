@@ -413,3 +413,73 @@ export const listOutOfSyncCases = async (limit = 10): Promise<ReviewCase[]> => {
 		.limit(limit)
 }
 
+// Receipt recovery is read-only until a conditional receipt/backoff write.
+// It deliberately does not acquire the escalation claim or authorize a POST.
+export const listOutstandingReviewReceipts = async (
+	guildId: string,
+	limit = 10,
+	claimTimeoutMs = 120_000
+): Promise<ReviewCase[]> => {
+	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
+	const backoffCutoff = new Date(Date.now() - 60_000).toISOString()
+	return getDb()
+		.select()
+		.from(reviewCases)
+		.where(and(
+			eq(reviewCases.guildId, guildId),
+			sql`((${reviewCases.deliveryStatus} = 'uncertain' AND ${reviewCases.updatedAt} <= ${backoffCutoff})
+				OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
+		))
+		.orderBy(asc(reviewCases.updatedAt), asc(reviewCases.caseId))
+		.limit(limit)
+}
+
+// Compare the observed row, rather than letting a late lookup overwrite a
+// newer receipt, disposition, or retry. No exclusive lease is needed for GET.
+const receiptSnapshotMatches = (snapshot: ReviewCase) => and(
+	eq(reviewCases.caseId, snapshot.caseId),
+	eq(reviewCases.guildId, snapshot.guildId),
+	eq(reviewCases.status, snapshot.status),
+	eq(reviewCases.deliveryStatus, snapshot.deliveryStatus),
+	eq(reviewCases.cardRevision, snapshot.cardRevision),
+	eq(reviewCases.updatedAt, snapshot.updatedAt),
+	sql`${reviewCases.reviewMessageId} IS ${snapshot.reviewMessageId}`,
+	sql`${reviewCases.reviewChannelId} IS ${snapshot.reviewChannelId}`
+)
+
+export const attachReviewCaseReceipt = async (
+	snapshot: ReviewCase,
+	channelId: string,
+	messageId: string
+): Promise<ReviewCase | null> => {
+	if (!channelId || !messageId ||
+		(snapshot.reviewMessageId && snapshot.reviewMessageId !== messageId) ||
+		(snapshot.reviewChannelId && snapshot.reviewChannelId !== channelId)) {
+		throw new Error(`Conflicting review receipt for ${snapshot.caseId}`)
+	}
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			reviewMessageId: messageId,
+			reviewChannelId: channelId,
+			deliveryStatus: "delivered",
+			// Receipt identity is not proof that the displayed contents are current.
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			updatedAt: now
+		})
+		.where(receiptSnapshotMatches(snapshot))
+		.returning()
+	return updated ?? null
+}
+
+export const deferReviewReceiptReconciliation = async (
+	snapshot: ReviewCase
+): Promise<ReviewCase | null> => {
+	if (!["uncertain", "delivering"].includes(snapshot.deliveryStatus)) return null
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({ deliveryStatus: "uncertain", updatedAt: now })
+		.where(receiptSnapshotMatches(snapshot))
+		.returning()
+	return updated ?? null
+}

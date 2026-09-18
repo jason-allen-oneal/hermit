@@ -2,6 +2,9 @@ import { type Client, Routes, serializePayload } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
 import {
 	allocateReescalationRevision,
+	attachReviewCaseReceipt,
+	deferReviewReceiptReconciliation,
+	listOutstandingReviewReceipts,
 	claimReviewCaseDelivery,
 	getReviewCase,
 	getUndeliveredEscalations,
@@ -19,40 +22,95 @@ type FindCardResult =
 	| { status: "not_found" }
 	| { status: "inconclusive" }
 
+const hasReviewIdentity = (value: unknown, caseId: string): boolean => {
+	if (Array.isArray(value)) return value.some((item) => hasReviewIdentity(item, caseId))
+	if (!value || typeof value !== "object") return false
+	const component = value as { content?: unknown; custom_id?: unknown; components?: unknown }
+	if (component.content === `-# hermit-review:v1:${caseId}`) return true
+	// Compatibility for existing open cards. Match the entire case ID, not a
+	// substring of another case, a model brief, or an unrelated message body.
+	if (typeof component.custom_id === "string") {
+		for (const prefix of ["review-dismiss", "review-watchlist", "review-confirm-bot"]) {
+			if (component.custom_id === `${prefix}:caseId=${caseId}`) return true
+		}
+	}
+	return hasReviewIdentity(component.components, caseId)
+}
+
+const isReviewReceipt = (
+	message: unknown,
+	channelId: string,
+	caseId: string
+): message is { id: string } => {
+	if (!message || typeof message !== "object") return false
+	const candidate = message as {
+		id?: unknown; channel_id?: unknown; components?: unknown
+		author?: { id?: unknown; bot?: unknown }
+	}
+	const botId = process.env.DISCORD_CLIENT_ID
+	return Boolean(botId) &&
+		candidate.author?.id === botId && candidate.author?.bot === true &&
+		typeof candidate.id === "string" && candidate.id.length > 0 &&
+		(candidate.channel_id === undefined || candidate.channel_id === channelId) &&
+		hasReviewIdentity(candidate.components, caseId)
+}
+
 const findExistingReviewCard = async (
 	client: Client,
 	channelId: string,
 	caseId: string,
-	targetUserId: string
+	_targetUserId: string
 ): Promise<FindCardResult> => {
-	const botId = process.env.DISCORD_CLIENT_ID
-	if (!botId) return { status: "inconclusive" }
-
+	if (!process.env.DISCORD_CLIENT_ID) return { status: "inconclusive" }
 	try {
-		const messages = (await client.rest.get(
-			Routes.channelMessages(channelId),
-			{ limit: 50 }
-		)) as any[]
-		if (!Array.isArray(messages)) return { status: "inconclusive" }
-
-		for (const message of messages) {
-			// Require EXACT bot identity and bot flag - strictly reject foreign bot messages
-			if (message.author?.id === botId && message.author?.bot === true) {
-				const contentStr = JSON.stringify(message.components ?? [])
-				// Require case-specific marker (caseId in customId or content) AND targetUserId
-				if (
-					contentStr.includes(`caseId=${caseId}`) ||
-					(contentStr.includes(caseId) && contentStr.includes(targetUserId))
-				) {
+		let before: string | undefined
+		// Bounded lookup. Exhausting the budget is not proof a send failed.
+		for (let page = 0; page < 5; page++) {
+			const messages = await client.rest.get(Routes.channelMessages(channelId), {
+				limit: 50,
+				...(before ? { before } : {})
+			}) as unknown
+			if (!Array.isArray(messages)) return { status: "inconclusive" }
+			for (const message of messages) {
+				if (isReviewReceipt(message, channelId, caseId)) {
 					return { status: "found", messageId: message.id }
 				}
 			}
+			if (messages.length < 50) return { status: "not_found" }
+			const lastId = messages[messages.length - 1]?.id
+			if (typeof lastId !== "string" || !lastId || lastId === before) {
+				return { status: "inconclusive" }
+			}
+			before = lastId
 		}
-		return { status: "not_found" }
+		return { status: "inconclusive" }
 	} catch (error) {
 		console.warn("Failed to check existing channel messages:", error)
 		return { status: "inconclusive" }
 	}
+}
+
+const attachAndSyncReviewReceipt = async (
+	client: Client,
+	caseId: string,
+	channelId: string,
+	messageId: string
+): Promise<boolean> => {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const current = await getReviewCase(caseId)
+		if (!current || current.guildId !== reviewConfig.guildId) return false
+		if ((current.reviewMessageId && current.reviewMessageId !== messageId) ||
+			(current.reviewChannelId && current.reviewChannelId !== channelId)) {
+			throw new Error(`Conflicting review receipt for ${caseId}`)
+		}
+		if (current.deliveryStatus === "delivered" && current.reviewMessageId === messageId) {
+			return syncSharedReviewCard(client, current)
+		}
+		const attached = await attachReviewCaseReceipt(current, channelId, messageId)
+		if (attached) return syncSharedReviewCard(client, attached)
+	}
+	// A changing row remains eligible for a later receipt-recovery pass.
+	return false
 }
 
 const generateNonce = async (key: string): Promise<string> => {
@@ -129,7 +187,17 @@ export async function postReviewEscalationCard(
 				claimedCase.reviewMessageId = null
 			} else {
 				console.warn("[ReviewNotifier] Failed to refresh existing card:", patchError)
-				await updateReviewCase(allocated.caseId, { deliveryStatus: "uncertain" })
+				const repairs = await Promise.allSettled([
+					markReviewCardStaleWrite(allocated.caseId, allocated.cardRevision),
+					deferReviewReceiptReconciliation(allocated)
+				])
+				const failures = repairs.filter((result) => result.status === "rejected")
+				if (failures.length > 0) {
+					throw new AggregateError(
+						failures.map((result) => result.reason),
+						"Failed to persist existing-card recovery work"
+					)
+				}
 				return
 			}
 		}
@@ -149,24 +217,7 @@ export async function postReviewEscalationCard(
 			claimedCase.targetUserId
 		)
 		if (lookup.status === "found") {
-			const currentCase = (await getReviewCase(claimedCase.caseId)) ?? claimedCase
-			await updateReviewCase(claimedCase.caseId, {
-				reviewMessageId: lookup.messageId,
-				reviewChannelId: channelId,
-				deliveryStatus: "delivered"
-			})
-			// If staff intervened (dismissed/watchlist) while awaiting history,
-			// or if the card needs updating to match current state, synchronize it!
-			if (
-				currentCase.status !== "escalated" ||
-				currentCase.cardRevision > currentCase.syncedCardRevision
-			) {
-				await syncSharedReviewCard(client, {
-					...currentCase,
-					reviewMessageId: lookup.messageId,
-					reviewChannelId: channelId
-				})
-			}
+			await attachAndSyncReviewReceipt(client, claimedCase.caseId, channelId, lookup.messageId)
 			return
 		}
 		// Inconclusive or not found: preserve uncertainty; do not send another POST
@@ -187,21 +238,17 @@ export async function postReviewEscalationCard(
 		claimedCase.targetUserId
 	)
 	if (existingCheck.status === "found") {
-		await updateReviewCase(claimedCase.caseId, {
-			reviewMessageId: existingCheck.messageId,
-			reviewChannelId: channelId,
-			deliveryStatus: "delivered"
-		})
+		await attachAndSyncReviewReceipt(client, claimedCase.caseId, channelId, existingCheck.messageId)
 		return
 	}
 
 	// Guard against case revisions made while awaiting channel history
 	const freshCase = await getReviewCase(claimedCase.caseId)
-	if (freshCase && freshCase.status !== "escalated") {
+	if (!freshCase || freshCase.status !== "escalated") {
 		// Staff intervened (dismissed/watchlist); abort send immediately
 		return
 	}
-	const caseToRender = freshCase ?? claimedCase
+	const caseToRender = freshCase
 
 	try {
 		// Render with fresh case state
@@ -224,25 +271,11 @@ export async function postReviewEscalationCard(
 
 		if (sent?.id) {
 			try {
-				await updateReviewCase(claimedCase.caseId, {
-					reviewMessageId: sent.id,
-					reviewChannelId: channelId,
-					deliveryStatus: "delivered"
-				})
-
-				// If staff intervened while the POST was in-flight, immediately synchronize the card
-				const postSendCase = await getReviewCase(claimedCase.caseId)
-				if (postSendCase && postSendCase.status !== "escalated") {
-					await syncSharedReviewCard(client, postSendCase)
-				}
+				await attachAndSyncReviewReceipt(client, claimedCase.caseId, channelId, sent.id)
 			} catch (dbError) {
-				console.error("D1 receipt write failed after Discord send:", dbError)
-				// Preserve uncertain status so recovery reconciles rather than resending
-				await updateReviewCase(claimedCase.caseId, {
-					reviewMessageId: sent.id,
-					reviewChannelId: channelId,
-					deliveryStatus: "uncertain"
-				}).catch(() => null)
+				// Leave the existing attempted-send state (or attached dirty receipt)
+				// recoverable. Never overwrite a newer receipt with this old response.
+				console.error("Review receipt attachment/synchronization failed:", dbError)
 			}
 		} else {
 			await updateReviewCase(claimedCase.caseId, {
@@ -268,68 +301,88 @@ export async function syncSharedReviewCard(
 	client: Client,
 	reviewCase: ReviewCase
 ): Promise<boolean> {
-	if (!reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
-		return false
-	}
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const fresh = await getReviewCase(reviewCase.caseId)
+		if (!fresh || fresh.guildId !== reviewConfig.guildId ||
+			!fresh.reviewMessageId || !fresh.reviewChannelId) return false
+		if (fresh.cardRevision <= fresh.syncedCardRevision) return true
 
-	const fresh = await getReviewCase(reviewCase.caseId)
-	if (!fresh || !fresh.reviewMessageId || !fresh.reviewChannelId) {
-		return false
-	}
-	if (fresh.cardRevision <= fresh.syncedCardRevision) {
-		return true // Already up to date
-	}
-
-	const renderedRevision = fresh.cardRevision
-	// Preserve active buttons when recovering an escalated card:
-	// If case is still escalated, render actionable buttons (closed = false);
-	// if decided (dismissed, watchlist, confirmed_bot), render closed state (closed = true).
-	const isClosed = fresh.status !== "escalated"
-	try {
-		const container = buildReviewCardContainer(fresh, null, null, isClosed)
-		await client.rest.patch(
-			Routes.channelMessage(
-				fresh.reviewChannelId,
-				fresh.reviewMessageId
-			),
-			{
-				body: serializePayload({
-					components: [container],
-					allowedMentions: { parse: [] }
-				})
-			}
-		)
-		const synced = await markReviewCardSynced(fresh.caseId, renderedRevision)
-		if (!synced) {
-			const staleWrite = await markReviewCardStaleWrite(
-				fresh.caseId,
-				renderedRevision
+		const renderedRevision = fresh.cardRevision
+		try {
+			const container = buildReviewCardContainer(fresh, null, null, fresh.status !== "escalated")
+			await client.rest.patch(
+				Routes.channelMessage(fresh.reviewChannelId, fresh.reviewMessageId),
+				{ body: serializePayload({ components: [container], allowedMentions: { parse: [] } }) }
 			)
-			if (
-				staleWrite &&
-				staleWrite.cardRevision > staleWrite.syncedCardRevision
-			) {
-				return await syncSharedReviewCard(client, staleWrite)
-			}
+			const synced = await markReviewCardSynced(fresh.caseId, renderedRevision)
+			if (synced) return true
+			await markReviewCardStaleWrite(fresh.caseId, renderedRevision)
+		} catch (error) {
+			console.warn("Failed to synchronize shared review card:", error)
+			// Discord may have applied this payload after a newer acknowledged
+			// write. A lost response is not proof that this write was rejected.
+			// Let persistence errors propagate so maintenance reports them.
+			await markReviewCardStaleWrite(fresh.caseId, renderedRevision)
 			return false
 		}
-		return true
-	} catch (error) {
-		console.warn("Failed to synchronize shared review card:", error)
-		return false
+	}
+	// Each stale acknowledgment above left durable dirty work for maintenance.
+	return false
+}
+
+export async function recoverReviewReceipts(client: Client) {
+	const outstanding = await listOutstandingReviewReceipts(reviewConfig.guildId, 10)
+	for (const reviewCase of outstanding) {
+		try {
+			if (reviewCase.guildId !== reviewConfig.guildId) continue
+			const channelId = reviewCase.reviewChannelId ?? reviewConfig.reviewChannelId
+			let result: FindCardResult
+			if (reviewCase.reviewMessageId) {
+				const message = await client.rest.get(
+					Routes.channelMessage(channelId, reviewCase.reviewMessageId)
+				)
+				result = isReviewReceipt(message, channelId, reviewCase.caseId) &&
+					message.id === reviewCase.reviewMessageId
+					? { status: "found", messageId: message.id }
+					: { status: "inconclusive" }
+			} else {
+				result = await findExistingReviewCard(client, channelId, reviewCase.caseId, reviewCase.targetUserId)
+			}
+			if (result.status === "found") {
+				await attachAndSyncReviewReceipt(client, reviewCase.caseId, channelId, result.messageId)
+			} else {
+				await deferReviewReceiptReconciliation(reviewCase)
+				console.warn(`[ReviewNotifier] Receipt for ${reviewCase.caseId} remains unresolved (${result.status})`)
+			}
+		} catch (error) {
+			console.error(`[ReviewNotifier] Receipt recovery failed for ${reviewCase.caseId}:`, error)
+			try {
+				await deferReviewReceiptReconciliation(reviewCase)
+			} catch (persistenceError) {
+				console.error("Failed to persist receipt recovery backoff:", persistenceError)
+			}
+		}
 	}
 }
 
 export async function recoverSharedCardSync(client: Client) {
 	const outOfSync = await listOutOfSyncCases(10)
 	for (const reviewCase of outOfSync) {
-		await syncSharedReviewCard(client, reviewCase)
+		try {
+			await syncSharedReviewCard(client, reviewCase)
+		} catch (error) {
+			console.error(`Shared card recovery failed for ${reviewCase.caseId}:`, error)
+		}
 	}
 }
 
 export async function recoverReviewEscalations(client: Client) {
 	const pending = await getUndeliveredEscalations(reviewConfig.guildId, 5)
 	for (const reviewCase of pending) {
-		await postReviewEscalationCard(client, reviewCase)
+		try {
+			await postReviewEscalationCard(client, reviewCase)
+		} catch (error) {
+			console.error(`Escalation recovery failed for ${reviewCase.caseId}:`, error)
+		}
 	}
 }

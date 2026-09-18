@@ -1,6 +1,8 @@
-/** Local Hermit + Real D1 Review Pipeline Proof; verifies D1 deployments, staff review, and recovery.
+/** Local D1 binding checks with MOCKED Discord transport. Not staging/deployment evidence.
  * Usage: bun scripts/proof-review-pipeline.ts
  */
+import assert from "node:assert/strict"
+import { assertReviewSchema, verifyPopulatedReviewUpgrade } from "./lib/reviewMigrationProof.js"
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises"
 import { resolve } from "node:path"
 import { readdirSync } from "node:fs"
@@ -13,30 +15,31 @@ import {
 	recordReviewCaseDecision,
 	markReviewCardSynced,
 	markReviewCardStaleWrite,
-	allocateReescalationRevision,
-	claimReviewCaseDelivery,
 	getUndeliveredEscalations,
 	listOutOfSyncCases
 } from "../src/data/review.js"
 import {
 	postReviewEscalationCard,
 	syncSharedReviewCard,
-	recoverReviewEscalations,
 	recoverSharedCardSync
 } from "../src/services/reviewNotifier.js"
-import { buildReviewCardContainer } from "../src/components/reviewButtons.js"
 
 const proofDir = resolve("/tmp/hermit-review-proof-" + Date.now())
 await mkdir(proofDir, { recursive: true })
 
-console.log("=== 🦞 HERMIT REVIEW PIPELINE REAL D1 BEHAVIOR PROOF ===")
+console.log("=== LOCAL D1 BINDINGS + MOCKED DISCORD TRANSPORT ===")
 console.log(`Proof Directory: ${proofDir}\n`)
+
+const disposers: Array<() => Promise<void>> = []
+let originalError: unknown
+const previousBotId = process.env.DISCORD_CLIENT_ID
+process.env.DISCORD_CLIENT_ID = "900000000000000001"
 
 try {
 	// -------------------------------------------------------------
-	// STEP 1: Fresh D1 Deployment & Migration Verification
+	// STEP 1: Fresh Local D1 Binding & Migration Verification
 	// -------------------------------------------------------------
-	console.log("--- STEP 1: Fresh D1 Deployment ---")
+	console.log("--- STEP 1: Fresh Local D1 Binding ---")
 	const configPath = resolve(proofDir, "wrangler.json")
 	await writeFile(
 		configPath,
@@ -61,6 +64,8 @@ try {
 		persist: { path: resolve(proofDir, "d1-state") }
 	})
 
+	disposers.push(() => proxy.dispose())
+
 	setRuntimeEnv({
 		DB: proxy.env.DB
 	})
@@ -83,40 +88,11 @@ try {
 		}
 	}
 
-	// Verify review_cases columns
-	const tableInfo = await proxy.env.DB.prepare(
-		"PRAGMA table_info(review_cases)"
-	).all<{ name: string; type: string }>()
-	const columnNames = tableInfo.results.map((r) => r.name)
-	console.log("✅ Applied migrations 0000..0013 successfully.")
-	console.log("Verified review_cases schema columns:")
-	console.log("  - card_revision:", columnNames.includes("card_revision") ? "EXISTS (INTEGER)" : "MISSING")
-	console.log("  - synced_card_revision:", columnNames.includes("synced_card_revision") ? "EXISTS (INTEGER)" : "MISSING")
-	console.log("  - previous_delivery_status:", columnNames.includes("previous_delivery_status") ? "EXISTS (TEXT)" : "MISSING")
+	await assertReviewSchema(proxy.env.DB)
+	console.log(`Fresh local D1 schema verified through ${sqlFiles.at(-1)}.`)
 
-	// -------------------------------------------------------------
-	// STEP 2: Populated D1 Upgrade Verification
-	// -------------------------------------------------------------
-	console.log("\n--- STEP 2: Populated D1 Upgrade Verification ---")
-	await proxy.env.DB.prepare(
-		`INSERT INTO keyValue (key, value, createdAt, updatedAt)
-		 VALUES ('proof-key-1', 'initial-data-val', 1700000000000, 1700000000000)`
-	).run()
-	await proxy.env.DB.prepare(
-		`INSERT INTO tracked_threads (thread_id, created_at, solved, raw_payload)
-		 VALUES ('thread-proof-1', '2026-09-01T00:00:00.000Z', 1, '{}')`
-	).run()
-
-	const kvBefore = await proxy.env.DB.prepare(
-		"SELECT key, value FROM keyValue WHERE key = 'proof-key-1'"
-	).first<{ key: string; value: string }>()
-	const threadBefore = await proxy.env.DB.prepare(
-		"SELECT thread_id, solved FROM tracked_threads WHERE thread_id = 'thread-proof-1'"
-	).first<{ thread_id: string; solved: number }>()
-
-	console.log(`Pre-existing row preserved: key="${kvBefore?.key}", val="${kvBefore?.value}"`)
-	console.log(`Pre-existing row preserved: thread_id="${threadBefore?.thread_id}", solved=${threadBefore?.solved}`)
-	console.log("✅ Verified zero data loss during schema migration.")
+	// A different database is migrated to 0012, seeded, snapshotted, THEN upgraded.
+	await verifyPopulatedReviewUpgrade(drizzleDir, sqlFiles, proofDir, (dispose) => disposers.push(dispose))
 
 	// -------------------------------------------------------------
 	// STEP 3: Staff Review Creation & Card Delivery
@@ -126,32 +102,47 @@ try {
 	const created = await createReviewCase({
 		caseId,
 		guildId: reviewConfig.guildId,
-		targetUserId: "1531171766179856496",
+		targetUserId: "900000000000000002",
 		status: "escalated",
 		heuristicScore: 92,
 		concordance: "High",
 		behavioralFamilies: JSON.stringify(["operational-artifact", "stylometry", "repetition"]),
 		deliveryStatus: "pending"
 	})
-	console.log(`Created review case in real D1:`)
+	assert(created)
+	assert.equal(created.status, "escalated")
+	console.log(`Created synthetic case in local D1:`)
 	console.log(`  Case ID: ${created?.caseId}`)
 	console.log(`  Status: ${created?.status}`)
 	console.log(`  Delivery Status: ${created?.deliveryStatus}`)
 	console.log(`  Card Revision: ${created?.cardRevision}`)
 
 	// Deliver escalation card
-	const deliveredMessageId = "discord-live-card-1001"
+	const deliveredMessageId = "900000000000000003"
+	let lastCard: unknown
+	let postCount = 0
 	const mockDiscord = {
 		rest: {
 			get: async () => [],
-			post: async (_route: string, _opts: any) => ({ id: deliveredMessageId }),
-			patch: async (_route: string, _opts: any) => ({})
+			post: async (_route: string, opts: any) => {
+				postCount++
+				lastCard = opts.body
+				return { id: deliveredMessageId }
+			},
+			patch: async (_route: string, opts: any) => {
+				lastCard = opts.body
+				return { id: deliveredMessageId }
+			}
 		}
 	} as any
 
 	await postReviewEscalationCard(mockDiscord, created!, null, null)
 	const afterPost = await getReviewCase(caseId)
-	console.log(`Delivered card to Discord:`)
+	assert.equal(afterPost?.reviewMessageId, deliveredMessageId)
+	assert.equal(afterPost?.deliveryStatus, "delivered")
+	assert.equal(afterPost?.cardRevision, afterPost?.syncedCardRevision)
+	assert.equal(postCount, 1)
+	console.log(`Delivered card through MOCKED Discord transport:`)
 	console.log(`  reviewMessageId: ${afterPost?.reviewMessageId}`)
 	console.log(`  deliveryStatus: ${afterPost?.deliveryStatus}`)
 	console.log(`  syncedCardRevision: ${afterPost?.syncedCardRevision}`)
@@ -167,7 +158,10 @@ try {
 		decidedById: "staff-operator-1",
 		decisionReason: "Observed automated timing; watchlisting 7d."
 	})
-	console.log(`Staff decision atomically recorded before Discord I/O:`)
+	assert(decided)
+	assert.equal(decided.status, "watchlist")
+	assert(decided.cardRevision > decided.syncedCardRevision)
+	console.log(`Staff decision atomically recorded before mocked Discord I/O:`)
 	console.log(`  Status: ${decided?.status}`)
 	console.log(`  ExpiresAt: ${decided?.expiresAt}`)
 	console.log(`  Card Revision bumped to: ${decided?.cardRevision} (synced was ${decided?.syncedCardRevision})`)
@@ -175,7 +169,10 @@ try {
 	// Sync shared card to Discord
 	await syncSharedReviewCard(mockDiscord, decided!)
 	const afterSync = await getReviewCase(caseId)
-	console.log(`Shared card synced:`)
+	assert(afterSync)
+	assert.equal(afterSync.syncedCardRevision, afterSync.cardRevision)
+	assert(JSON.stringify(lastCard).includes("WATCHLIST"))
+	console.log(`Shared card synced through MOCKED transport:`)
 	console.log(`  syncedCardRevision: ${afterSync?.syncedCardRevision}`)
 
 	// -------------------------------------------------------------
@@ -184,18 +181,24 @@ try {
 	console.log("\n--- STEP 5: Stale Write Detection & Repair Scheduling ---")
 	// Simulate an older delayed sync for revision 1 completing after revision 2
 	const staleAttempt = await markReviewCardSynced(caseId, 1)
+	assert.equal(staleAttempt, null)
 	console.log(`Delayed sync attempt for revision 1 result: ${staleAttempt ? "ACCEPTED" : "REJECTED (Correct)"}`)
 
 	// Schedule repair on stale write
 	const repaired = await markReviewCardStaleWrite(caseId, 1)
+	assert(repaired && repaired.cardRevision > repaired.syncedCardRevision)
 	console.log(`markReviewCardStaleWrite allocated repair revision: ${repaired?.cardRevision}`)
 	const outOfSync = await listOutOfSyncCases(5)
+	assert(outOfSync.some((item) => item.caseId === caseId))
+	await recoverSharedCardSync(mockDiscord)
+	const recovered = await getReviewCase(caseId)
+	assert.equal(recovered?.cardRevision, recovered?.syncedCardRevision)
 	console.log(`Maintenance detected out-of-sync cases: ${outOfSync.length} case(s) queued for sync repair`)
 
 	// -------------------------------------------------------------
-	// STEP 6: Fair Recovery Queue & Starvation Prevention
+	// STEP 6: Pending Priority and Uncertainty Backoff
 	// -------------------------------------------------------------
-	console.log("\n--- STEP 6: Recovery Fairness & Starvation Prevention ---")
+	console.log("\n--- STEP 6: Pending Priority and Uncertainty Backoff ---")
 	const now = Date.now()
 	await proxy.env.DB.prepare(
 		`INSERT INTO review_cases (case_id, guild_id, target_user_id, status, heuristic_score, concordance, behavioral_families, delivery_status, updated_at)
@@ -208,9 +211,31 @@ try {
 	const ids = escalations.map((e) => e.caseId)
 	console.log("Candidate recovery ordering (least-recently attempted & prioritized):")
 	ids.forEach((id, idx) => console.log(`  ${idx + 1}. ${id}`))
-	console.log("✅ Verified: Pending case scheduled first; uncertain case (<60s) backed off to prevent queue starvation.")
+	assert.equal(ids[0], "proof-pending-new")
+	assert(ids.includes("proof-unc-old"))
+	assert(!ids.includes("proof-unc-recent"))
+	console.log("Verified pending priority and recent-uncertainty backoff for these fixtures.")
 
-	console.log("\n=== ✅ ALL REAL D1 BEHAVIOR PROOFS VERIFIED SUCCESSFULLY ===")
+	console.log("\nLocal D1 / mocked transport assertions passed. No live Worker, Discord, or model-provider run was performed.")
+} catch (error) {
+	originalError = error
+	throw error
 } finally {
-	await rm(proofDir, { recursive: true, force: true })
+	if (previousBotId === undefined) delete process.env.DISCORD_CLIENT_ID
+	else process.env.DISCORD_CLIENT_ID = previousBotId
+	let cleanupError: unknown
+	const disposed = await Promise.allSettled(disposers.map((dispose) => dispose()))
+	const failures = disposed.filter((result) => result.status === "rejected")
+	if (failures.length) {
+		cleanupError = new AggregateError(failures.map((result) => result.reason), "Local proxy disposal failed")
+	}
+	// Do not remove persistence beneath a still-running proxy.
+	if (!cleanupError) {
+		try { await rm(proofDir, { recursive: true, force: true }) }
+		catch (error) { cleanupError = error }
+	}
+	if (cleanupError) {
+		if (originalError) console.error("Proof cleanup also failed:", cleanupError)
+		else throw cleanupError
+	}
 }
