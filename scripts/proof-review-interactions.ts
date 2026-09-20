@@ -126,7 +126,7 @@ try {
  const secret=randomUUID()+randomUUID();const bridge=startDiscrawlServer({exportPath:fixturePath,secret,port:0});stopBridge=()=>bridge.stop(true)
  delete process.env.DISCRAWL_EXPORT_PATH;process.env.DISCRAWL_EXPORT_URL=`http://127.0.0.1:${bridge.port}`;process.env.DISCRAWL_SECRET=secret;process.env.ENABLE_AUTOMATIC_SCREENING="false"
  const roles:any=await client.rest.get(`/guilds/${config.guildId}/roles`)
- const role=roles.find((entry:any)=>entry.id===roleId);assert(role && role.permissions==="0","Test role must exist with zero permissions")
+ const role=roles.find((entry:any)=>entry.id===roleId);assert(role && String(role.permissions)==="0","Test role must exist with zero permissions")
  Object.assign(reviewConfig,{guildId:config.guildId,reviewChannelId:config.channelId,staffRoleIds:[roleId]})
  const registered:any=await client.rest.post(commandRoute,{body:command.serialize()});commandId=registered.id
  await gateway.registerClient(client)
@@ -147,3 +147,6 @@ try {
  if(cleanupFailed)process.exitCode=1
  console.log(`Private evidence retained at ${root}`)
 }
+// Carbon's internal timers can outlive the disconnected proof client. All
+// owned resources and evidence writes have completed above.
+process.exit(process.exitCode ? Number(process.exitCode) : 0)
