@@ -19,7 +19,11 @@ describe("live proof scope preflight (no network)", () => {
 		const wire = JSON.parse(JSON.stringify(payload.components))
 		wire[0].id = 1
 		wire[0].components[0].id = 2
+		delete wire[0].components[1].components[0].disabled
 		expect(normalizeProofCard(payload.components)).toEqual(normalizeProofCard(wire))
+		wire[0].components[1].components[0].disabled = true
+		expect(normalizeProofCard(payload.components)).not.toEqual(normalizeProofCard(wire))
+		delete wire[0].components[1].components[0].disabled
 		wire[0].components[0].content = "Stale synthetic state"
 		expect(normalizeProofCard(payload.components)).not.toEqual(normalizeProofCard(wire))
 	})

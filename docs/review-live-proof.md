@@ -17,6 +17,8 @@ The bridge has a random per-run bearer secret and is stopped afterward.
 The test account being assessed is the test bot itself. Its input is generated
 fixture text, never channel history or real member telemetry. Only the
 configured channel is accessed. Production review guild/channel IDs are refused.
+Card comparisons ignore server-assigned component IDs and treat an omitted
+button `disabled` flag as false; true and every rendered field remain checked.
 The runner overrides review coordinates in its own process; production files,
 bot endpoint, command registrations, and deployed services remain unchanged.
 
