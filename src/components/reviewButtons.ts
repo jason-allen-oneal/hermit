@@ -172,12 +172,15 @@ const finishReviewDecision = async (
 		if (targetsSharedCard) {
 			const synced = await markReviewCardSynced(updated.caseId, updated.cardRevision)
 			needsSharedSync = !synced
-			if (synced && writeAttemptToken) {
+			if (!synced && !await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)) {
+				throw new Error(`Failed to persist acknowledged stale-card repair for ${updated.caseId}`)
+			}
+			// A successful interaction response resolves this attempt, but stale
+			// content must have durable repair work before its ledger is retired.
+			if (writeAttemptToken) {
 				if (!await completeReviewCardWrite(writeAttemptToken)) {
 					throw new Error(`Failed to close interaction card write for ${updated.caseId}`)
 				}
-			} else if (!synced) {
-				await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)
 			}
 		}
 	} catch (error) {

@@ -217,11 +217,16 @@ export async function postReviewEscalationCard(
 				allocated.cardRevision
 			)
 			if (!synced) {
-				await markReviewCardStaleWrite(allocated.caseId, allocated.cardRevision)
-				await syncSharedReviewCard(client, allocated)
-			} else if (!await completeReviewCardWrite(writeAttemptToken)) {
+				if (!await markReviewCardStaleWrite(allocated.caseId, allocated.cardRevision)) {
+					throw new Error(`Failed to persist acknowledged stale-card repair for ${allocated.caseId}`)
+				}
+			}
+			// Discord acknowledged this write: once repair is durable, it is no
+			// longer an unknown outcome, even when its rendered revision was stale.
+			if (!await completeReviewCardWrite(writeAttemptToken)) {
 				throw new Error(`Failed to close re-escalation card write for ${allocated.caseId}`)
 			}
+			if (!synced) await syncSharedReviewCard(client, allocated)
 			const completed = await completeReviewCaseDelivery(
 				allocated.caseId,
 				deliveryToken,
@@ -362,7 +367,12 @@ export async function syncSharedReviewCard(
 				}
 				return true
 			}
-			await markReviewCardStaleWrite(fresh.caseId, renderedRevision)
+			if (!await markReviewCardStaleWrite(fresh.caseId, renderedRevision)) {
+				throw new Error(`Failed to persist acknowledged stale-card repair for ${fresh.caseId}`)
+			}
+			if (!await completeReviewCardWrite(writeAttemptToken)) {
+				throw new Error(`Failed to close acknowledged stale-card write for ${fresh.caseId}`)
+			}
 		} catch (error) {
 			console.warn("Failed to synchronize shared review card:", error)
 			if (error && typeof error === "object" && "status" in error &&

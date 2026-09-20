@@ -136,6 +136,7 @@ it("keeps repair pending when an old PATCH applies after a newer acknowledgment 
 	await recoverSharedCardSync(fake.client)
 	assert(hasStatus(fake, "DISMISSED"))
 	assert.equal((await current()).cardRevision, (await current()).syncedCardRevision)
+	assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 1)
 })
 
 it("recovers an interrupted PATCH that applies after multiple completed repair passes", async () => {
@@ -358,6 +359,85 @@ const buttons = [
 	[ReviewDismissButton, "dismissed"], [ReviewWatchlistButton, "watchlist"], [ReviewConfirmBotButton, "confirmed_bot"]
 ] as const
 
+const acknowledgedWritePaths = [
+	"synchronization", "re-escalation", ...buttons.map(([, disposition]) => disposition)
+] as const
+
+for (const path of acknowledgedWritePaths) {
+	for (const repairFails of [false, true]) {
+		it(`${path}: ${repairFails ? "retains acknowledged stale attempt when repair persistence fails" : "retires acknowledged stale attempt only after durable repair"}`, async () => {
+			const row = await seed({
+				reviewMessageId: MESSAGE,
+				deliveryStatus: path === "re-escalation" ? "pending" : "delivered",
+				cardRevision: 2,
+				syncedCardRevision: 1
+			})
+			const fake = fakeDiscord(), started = gate(), release = gate()
+			const patch = fake.transport.rest.patch
+			const applyDelayed = async (route: string, options: any) => {
+				started.release()
+				await release.promise
+				return patch(route, options)
+			}
+			let pending: Promise<unknown>
+			if (path === "synchronization" || path === "re-escalation") {
+				let first = true
+				fake.transport.rest.patch = (route, options) => {
+					if (!first) return patch(route, options)
+					first = false
+					return applyDelayed(route, options)
+				}
+				pending = path === "synchronization"
+					? syncSharedReviewCard(fake.client, row)
+					: postReviewEscalationCard(fake.client, row)
+			} else {
+				const ButtonType = buttons.find(([, disposition]) => disposition === path)![0]
+				pending = new ButtonType().run(interaction(fake, async (options) =>
+					applyDelayed(`/channels/${reviewConfig.reviewChannelId}/messages/${MESSAGE}`, { body: serializePayload(options) })
+				), { caseId: row.caseId, rev: row.cardRevision })
+			}
+			// Attach rejection handling before allowing the delayed response through.
+			const outcome = pending.then(() => null, (error: unknown) => error)
+			await started.promise
+			const original = db.database.query(
+				"SELECT attempt_token FROM review_card_write_attempts WHERE case_id = ?"
+			).get(row.caseId) as { attempt_token: string }
+			assert(original)
+			await seed({ caseId: row.caseId, heuristicScore: 42 })
+			await syncSharedReviewCard(fake.client, await current())
+			assert.equal((await current()).cardRevision, (await current()).syncedCardRevision)
+			const complete = data.completeReviewCardWrite
+			let retiredOriginal = false
+			spyOn(data, "completeReviewCardWrite").mockImplementation(async (token) => {
+				if (token === original.attempt_token) {
+					const repair = await current()
+					assert(repair.cardRevision > repair.syncedCardRevision, "repair must persist before acknowledged stale attempt retirement")
+					retiredOriginal = true
+				}
+				return complete(token)
+			})
+			if (repairFails) {
+				spyOn(data, "markReviewCardStaleWrite").mockRejectedValue(new Error("repair persistence unavailable"))
+			}
+			release.release()
+			const error = await outcome
+			const remaining = db.database.query(
+				"SELECT count(*) AS count FROM review_card_write_attempts WHERE attempt_token = ?"
+			).get(original.attempt_token) as { count: number }
+			assert.equal(retiredOriginal, !repairFails)
+			assert.equal(remaining.count, repairFails ? 1 : 0)
+			if (repairFails) {
+				assert(error instanceof AggregateError)
+			} else {
+				assert.equal(error, null)
+				assert.equal((await current()).cardRevision, (await current()).syncedCardRevision)
+				assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("42/100"))
+				assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 0)
+			}
+		})
+	}
+}
+
 it("allows exactly one staff decision for a displayed revision", async () => {
 	const row = await seed()
 	const [dismissed, confirmed] = await Promise.all([
@@ -439,6 +519,7 @@ for (const [ButtonType, disposition] of buttons) {
 		assert.equal(result.cardRevision, result.syncedCardRevision)
 		assert(hasStatus(fake, disposition.toUpperCase()))
 		assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("42/100"))
+		assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 1)
 	})
 	it(`${disposition}: ephemeral response failure does not skip shared synchronization`, async () => {
 		const row = await seed({ reviewMessageId: MESSAGE, deliveryStatus: "delivered" })
@@ -841,6 +922,7 @@ it("bounds stale acknowledgment retries while leaving discoverable dirty work", 
 	}
 	assert.equal(await syncSharedReviewCard(fake.client, row), false)
 	assert.equal(fake.state.patches, 3)
+	assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 0)
 	const deferred = await current()
 	assert(deferred.cardRevision > deferred.syncedCardRevision)
 	assert(deferred.cardSyncNextAttemptAt)
@@ -983,6 +1065,7 @@ it("preserves repair work when an old re-escalation PATCH applies and loses its 
 	await recoverSharedCardSync(fake.client)
 	assert(hasStatus(fake, "DISMISSED"))
 	assert.equal(fake.state.posts, 0)
+	assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 1)
 })
 
 it("surfaces a failure to persist ambiguous-write repair instead of returning success", async () => {

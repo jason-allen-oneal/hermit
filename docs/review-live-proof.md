@@ -101,3 +101,30 @@ Still separate, even after this runner passes:
 
 Update `## Real Behavior Proof` with only the observed scope, exact tested HEAD,
 command, relevant output, inspected artifact, and these explicit limits.
+
+## Actual Gateway interaction proof
+
+`bun --no-env-file scripts/proof-review-interactions.ts --live` is a separate
+opt-in ingress runner, not a claim of a completed run. It requires the same test
+configuration plus `HERMIT_PROOF_ACTOR_IDS` (comma-separated authorized owners).
+It refuses an existing guild `/review` command or an application with an HTTP
+interaction endpoint. It adds only its own temporary guild command and a new
+zero-permission role, mapping that role as staff inside the test process. The
+actual actor starts without that role. After a genuine rejected command, the
+runner adds the role to that actor for the authorized control. It deletes only
+its own command and role in `finally`, including failure/timeout cleanup.
+
+It uses a separate zero-intent Carbon Gateway connection, listens only for test
+channel/actor interactions, and passes their actual payloads unchanged to the
+same Carbon interaction router used by the Worker. The production command and
+button handlers are unchanged. Existing bot configuration, global commands,
+and interaction endpoint are not modified. No message history is ingested.
+
+In the authorized browser, run `/review user:<test bot>` twice (first denied,
+then allowed), click Dismiss on the now-stale ephemeral command card, then click
+Dismiss on the current shared card. The runner asserts real webhook responses,
+D1 denial/preservation/decision, and exact real shared-card GET readback. Never
+fabricate a Discord event or interaction token. Artifacts remain private under
+`~/.local/state/hermit-interaction-proof/`. This exercises real Gateway ingress,
+not deployed Worker HTTP signature validation. Provider execution is excluded
+and `OPENAI_API_KEY` must be absent to keep that proof independent.
