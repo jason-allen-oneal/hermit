@@ -24,7 +24,7 @@ export async function assertReviewSchema(db: D1Database) {
 		["receipt_next_attempt_at", "TEXT"], ["receipt_history_before", "TEXT"],
 		["card_sync_next_attempt_at", "TEXT"], ["card_sync_failure_count", "INTEGER"],
 		["delivery_preflight_completed_at", "TEXT"], ["delivery_post_attempted_at", "TEXT"],
-		["key_signals", "TEXT"]
+		["delivery_attempt_state", "TEXT"], ["key_signals", "TEXT"]
 	]) {
 		const column = columns.find((item) => item.name === name)
 		assert(column, `Missing review_cases.${name}`)
@@ -32,20 +32,23 @@ export async function assertReviewSchema(db: D1Database) {
 	}
 	for (const name of [
 		"card_revision", "synced_card_revision", "previous_delivery_status", "card_sync_failure_count",
-		"key_signals"
+		"key_signals", "delivery_attempt_state"
 	]) {
 		assert.equal(columns.find((item) => item.name === name)?.notnull, 1)
 	}
 	assert.equal(columns.find((item) => item.name === "card_sync_failure_count")?.dflt_value, "0")
 	assert.equal(columns.find((item) => item.name === "key_signals")?.dflt_value, "'[]'")
+	assert.equal(columns.find((item) => item.name === "delivery_attempt_state")?.dflt_value, "'legacy_unknown'")
 	const indexes = (await db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
 		.all<{ name: string }>()).results.map((item) => item.name)
 	for (const name of [
 		"review_cases_case_id_unique", "idx_review_cases_guild_target", "idx_review_cases_status",
 		"idx_review_cases_review_msg", "idx_review_cases_receipt_recovery",
 		"idx_review_cases_card_sync_due", "review_observations_message_id_unique",
+		"idx_review_card_write_attempts_due", "idx_review_card_write_attempts_case",
 		"idx_review_obs_guild_author", "idx_review_obs_author", "idx_review_obs_channel", "idx_review_obs_message"
 	]) assert(indexes.includes(name), `Missing index ${name}`)
+	assert(await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_card_write_attempts'").first())
 
 	const insert = `INSERT INTO review_cases
 		(case_id, guild_id, target_user_id, heuristic_score, concordance, behavioral_families)
@@ -170,7 +173,8 @@ export async function verifyPopulatedReviewUpgrade(
 			delivery_nonce, delivery_claim_token, delivery_claim_expires_at,
 			receipt_claim_token, receipt_claim_expires_at, receipt_next_attempt_at,
 			receipt_history_before, card_sync_next_attempt_at, card_sync_failure_count,
-			delivery_preflight_completed_at, delivery_post_attempted_at, key_signals
+			delivery_preflight_completed_at, delivery_post_attempted_at,
+			delivery_attempt_state, key_signals
 			FROM review_cases WHERE case_id = 'populated-review-case'`)
 			.first<Record<string, unknown>>()
 		assert(additiveDefaults)
@@ -186,6 +190,7 @@ export async function verifyPopulatedReviewUpgrade(
 			card_sync_failure_count: 0,
 			delivery_preflight_completed_at: null,
 			delivery_post_attempted_at: null,
+			delivery_attempt_state: "legacy_unknown",
 			key_signals: "[]"
 		})
 		await assertReviewSchema(db)

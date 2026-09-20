@@ -3,13 +3,18 @@ import { reviewConfig } from "../config/review.js"
 import {
 	allocateReescalationRevision,
 	attachReviewCaseReceipt,
+	beginReviewCardWrite,
+	claimOutstandingReviewCardWrite,
 	claimReviewReceiptReconciliation,
 	clearDeletedReviewReceipt,
 	completeReviewCaseDelivery,
+	completeReviewCardWrite,
 	deferClaimedReviewDeliveryReceipt,
 	deferReviewCardSync,
+	deferOutstandingReviewCardWrite,
 	deferReviewReceiptReconciliation,
 	listOutstandingReviewReceipts,
+	listOutstandingReviewCardWrites,
 	claimReviewCaseDelivery,
 	getReviewCase,
 	getUndeliveredEscalations,
@@ -18,6 +23,7 @@ import {
 	markReviewCardSynced,
 	markReviewPostAttemptStarted,
 	releaseUnattemptedReviewDelivery,
+	reconcileOutstandingReviewCardWrite,
 	type ReviewReceiptOwner
 } from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
@@ -336,13 +342,20 @@ export async function syncSharedReviewCard(
 		if (fresh.cardRevision <= fresh.syncedCardRevision) return true
 
 		const renderedRevision = fresh.cardRevision
+		const writeAttemptToken = crypto.randomUUID()
+		await beginReviewCardWrite(fresh, renderedRevision, writeAttemptToken)
 		try {
 			await client.rest.patch(
 				Routes.channelMessage(fresh.reviewChannelId, fresh.reviewMessageId),
 				{ body: buildSharedReviewPayload(fresh) }
 			)
 			const synced = await markReviewCardSynced(fresh.caseId, renderedRevision)
-			if (synced) return true
+			if (synced) {
+				if (!await completeReviewCardWrite(writeAttemptToken)) {
+					throw new Error(`Failed to close shared-card write attempt for ${fresh.caseId}`)
+				}
+				return true
+			}
 			await markReviewCardStaleWrite(fresh.caseId, renderedRevision)
 		} catch (error) {
 			console.warn("Failed to synchronize shared review card:", error)
@@ -383,6 +396,30 @@ export async function syncSharedReviewCard(
 		}
 	}
 	return false
+}
+
+export async function recoverOutstandingReviewCardWrites(client: Client) {
+	const outstanding = await listOutstandingReviewCardWrites(reviewConfig.guildId, 10)
+	for (const candidate of outstanding) {
+		const claimToken = crypto.randomUUID()
+		const attempt = await claimOutstandingReviewCardWrite(candidate.attemptToken, claimToken)
+		if (!attempt) continue
+		try {
+			const reviewCase = await reconcileOutstandingReviewCardWrite(attempt, claimToken)
+			if (!reviewCase) {
+				if (!await completeReviewCardWrite(attempt.attemptToken)) {
+					throw new Error(`Could not retire obsolete shared-card write ${attempt.attemptToken}`)
+				}
+				continue
+			}
+			await syncSharedReviewCard(client, reviewCase)
+		} catch (error) {
+			console.error(`Outstanding card-write recovery failed for ${attempt.caseId}:`, error)
+			await deferOutstandingReviewCardWrite(attempt.attemptToken, claimToken).catch(
+				(persistenceError) => console.error("Failed to persist card-write backoff:", persistenceError)
+			)
+		}
+	}
 }
 
 export async function recoverReviewReceipts(client: Client) {
@@ -429,7 +466,8 @@ export async function recoverReviewReceipts(client: Client) {
 					{ kind: "receipt", token: claimToken }
 				)
 			} else if (result.status === "not_found" &&
-				!reviewCase.reviewMessageId && !reviewCase.deliveryPostAttemptedAt) {
+				!reviewCase.reviewMessageId &&
+				reviewCase.deliveryAttemptState === "unattempted") {
 				// A complete history scan proved there is no receipt, and the durable
 				// pre-I/O fact proves this delivery generation never reached POST.
 				// Release it for the later new-send stage without manufacturing an

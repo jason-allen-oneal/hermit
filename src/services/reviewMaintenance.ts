@@ -3,6 +3,7 @@ import { expireWatchlistCases, pruneOldObservations } from "../data/review.js"
 import {
 	recoverReviewReceipts,
 	recoverReviewEscalations,
+	recoverOutstandingReviewCardWrites,
 	recoverSharedCardSync
 } from "./reviewNotifier.js"
 
@@ -12,6 +13,7 @@ export const runReviewMaintenance = async (client: Client) => {
 		["observation retention", () => pruneOldObservations(14)],
 		["receipt reconciliation", () => recoverReviewReceipts(client)],
 		["escalation delivery", () => recoverReviewEscalations(client)],
+		["ambiguous card-write recovery", () => recoverOutstandingReviewCardWrites(client)],
 		["shared-card synchronization", () => recoverSharedCardSync(client)]
 	]
 	for (const [name, run] of stages) {

@@ -496,6 +496,7 @@ export const reviewCases = sqliteTable(
 		deliveryNonce: text("delivery_nonce"),
 		deliveryPreflightCompletedAt: text("delivery_preflight_completed_at"),
 		deliveryPostAttemptedAt: text("delivery_post_attempted_at"),
+		deliveryAttemptState: text("delivery_attempt_state").notNull().default("legacy_unknown"),
 		deliveryClaimToken: text("delivery_claim_token"),
 		deliveryClaimExpiresAt: text("delivery_claim_expires_at"),
 		receiptClaimToken: text("receipt_claim_token"),
@@ -534,6 +535,34 @@ export const reviewCases = sqliteTable(
 	]
 )
 
+export const reviewCardWriteAttempts = sqliteTable(
+	"review_card_write_attempts",
+	{
+		attemptToken: text("attempt_token").primaryKey(),
+		caseId: text("case_id").notNull(),
+		guildId: text("guild_id").notNull(),
+		channelId: text("channel_id").notNull(),
+		messageId: text("message_id").notNull(),
+		renderedRevision: integer("rendered_revision").notNull(),
+		claimToken: text("claim_token"),
+		claimExpiresAt: text("claim_expires_at"),
+		nextAttemptAt: text("next_attempt_at"),
+		failureCount: integer("failure_count").notNull().default(0),
+		createdAt: text("created_at")
+			.notNull()
+			.default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+	},
+	(table) => [
+		index("idx_review_card_write_attempts_due").on(
+			table.guildId,
+			table.nextAttemptAt,
+			table.claimExpiresAt,
+			table.createdAt
+		),
+		index("idx_review_card_write_attempts_case").on(table.caseId)
+	]
+)
+
 export type KeyValue = typeof keyValue.$inferSelect
 export type NewKeyValue = typeof keyValue.$inferInsert
 export type HelperEvent = typeof helperEvents.$inferSelect
@@ -566,3 +595,4 @@ export type ReviewObservation = typeof reviewObservations.$inferSelect
 export type NewReviewObservation = typeof reviewObservations.$inferInsert
 export type ReviewCase = typeof reviewCases.$inferSelect
 export type NewReviewCase = typeof reviewCases.$inferInsert
+export type ReviewCardWriteAttempt = typeof reviewCardWriteAttempts.$inferSelect

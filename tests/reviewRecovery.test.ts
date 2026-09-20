@@ -13,6 +13,7 @@ import {
 	syncSharedReviewCard,
 	recoverReviewReceipts,
 	recoverReviewEscalations,
+	recoverOutstandingReviewCardWrites,
 	recoverSharedCardSync
 } from "../src/services/reviewNotifier.js"
 import { runReviewMaintenance } from "../src/services/reviewMaintenance.js"
@@ -30,6 +31,7 @@ beforeEach(() => {
 	db.database.exec(readFileSync("drizzle/0014_review_recovery_ownership.sql", "utf8"))
 	db.database.exec(readFileSync("drizzle/0015_review_delivery_attempt_state.sql", "utf8"))
 	db.database.exec(readFileSync("drizzle/0016_chilly_loners.sql", "utf8"))
+	db.database.exec(readFileSync("drizzle/0017_optimal_leopardon.sql", "utf8"))
 	setRuntimeEnv({ DB: db as unknown as D1Database })
 })
 afterEach(() => {
@@ -134,6 +136,72 @@ it("keeps repair pending when an old PATCH applies after a newer acknowledgment 
 	await recoverSharedCardSync(fake.client)
 	assert(hasStatus(fake, "DISMISSED"))
 	assert.equal((await current()).cardRevision, (await current()).syncedCardRevision)
+})
+
+it("recovers a persisted PATCH attempt without waiting for the interrupted worker", async () => {
+	const row = await seed({
+		reviewMessageId: MESSAGE,
+		deliveryStatus: "delivered",
+		cardRevision: 2,
+		syncedCardRevision: 1
+	})
+	const fake = fakeDiscord()
+	setCard(fake, { ...row, cardRevision: 1, syncedCardRevision: 1 })
+	const applied = gate()
+	const stranded = gate()
+	const ordinaryPatch = fake.transport.rest.patch
+	let first = true
+	fake.transport.rest.patch = async (route, options) => {
+		if (first) {
+			first = false
+			await ordinaryPatch(route, options)
+			applied.release()
+			await stranded.promise
+			return { id: MESSAGE }
+		}
+		return ordinaryPatch(route, options)
+	}
+
+	const interrupted = syncSharedReviewCard(fake.client, row)
+	await applied.promise
+	const pending = db.database.query(
+		"SELECT rendered_revision FROM review_card_write_attempts WHERE case_id = ?"
+	).get(row.caseId) as { rendered_revision: number }
+	assert.equal(pending.rendered_revision, 2)
+
+	await recoverOutstandingReviewCardWrites(fake.client)
+	const repaired = await current()
+	assert.equal(repaired.syncedCardRevision, repaired.cardRevision)
+	assert(hasStatus(fake, "ESCALATED"))
+	assert.equal(db.database.query(
+		"SELECT count(*) AS count FROM review_card_write_attempts"
+	).get().count, 0)
+
+	stranded.release()
+	await interrupted
+	await recoverSharedCardSync(fake.client)
+})
+
+it("keeps migrated unknown delivery history out of the new-send path", async () => {
+	const stale = new Date(Date.now() - 180_000).toISOString()
+	db.database.run(
+		`INSERT INTO review_cases (
+			case_id, guild_id, target_user_id, status, heuristic_score,
+			concordance, behavioral_families, delivery_status, updated_at
+		) VALUES (?, ?, ?, 'escalated', 80, 'High', '[]', 'uncertain', ?)`,
+		["legacy-unknown", reviewConfig.guildId, "legacy-user", stale]
+	)
+	const inserted = await current("legacy-unknown")
+	assert.equal(inserted.deliveryAttemptState, "legacy_unknown")
+	const fake = fakeDiscord()
+
+	await recoverReviewReceipts(fake.client)
+	await recoverReviewEscalations(fake.client)
+
+	const after = await current("legacy-unknown")
+	assert.equal(after.deliveryStatus, "uncertain")
+	assert.equal(after.deliveryAttemptState, "legacy_unknown")
+	assert.equal(fake.state.posts, 0)
 })
 
 const buttons = [

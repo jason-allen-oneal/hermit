@@ -2,10 +2,12 @@ import { and, eq, gte, gt, sql, desc, asc, inArray } from "drizzle-orm"
 import { getDb } from "../db.js"
 import {
 	reviewCases,
+	reviewCardWriteAttempts,
 	reviewObservations,
 	type NewReviewCase,
 	type NewReviewObservation,
 	type ReviewCase,
+	type ReviewCardWriteAttempt,
 	type ReviewObservation
 } from "../db/schema.js"
 import type { ReviewMessage } from "../review/types.js"
@@ -137,6 +139,10 @@ export const getRecentUserObservations = async (
 export const createReviewCase = async (
 	data: NewReviewCase
 ): Promise<ReviewCase | null> => {
+	const insertData = {
+		...data,
+		deliveryAttemptState: data.deliveryAttemptState ?? "unattempted"
+	}
 	const reopening = sql`(review_cases.status = 'open' OR (
 		review_cases.status = 'watchlist'
 		AND review_cases.expires_at IS NOT NULL
@@ -151,7 +157,7 @@ export const createReviewCase = async (
 	)`
 	const [reviewCase] = await getDb()
 		.insert(reviewCases)
-		.values(data)
+		.values(insertData)
 		.onConflictDoUpdate({
 			target: [reviewCases.caseId],
 			set: {
@@ -179,6 +185,11 @@ export const createReviewCase = async (
 						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_post_attempted_at
 						WHEN ${reopening} THEN NULL
 						ELSE review_cases.delivery_post_attempted_at
+					END`,
+					deliveryAttemptState: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_attempt_state
+						WHEN ${reopening} THEN 'unattempted'
+						ELSE review_cases.delivery_attempt_state
 					END`,
 					deliveryClaimToken: sql`CASE
 						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_claim_token
@@ -299,6 +310,7 @@ export const completeReviewCaseDelivery = async (
 			deliveryStatus,
 			deliveryPreflightCompletedAt: deliveryStatus === "failed" ? now : null,
 			deliveryPostAttemptedAt: null,
+			deliveryAttemptState: deliveryStatus === "failed" ? "unattempted" : "attempted",
 			deliveryClaimToken: null,
 			deliveryClaimExpiresAt: null,
 			updatedAt: now
@@ -347,6 +359,7 @@ export const markReviewPostAttemptStarted = async (
 		.set({
 			deliveryPreflightCompletedAt: null,
 			deliveryPostAttemptedAt: now,
+			deliveryAttemptState: "attempted",
 			updatedAt: now
 		})
 		.where(and(
@@ -375,6 +388,7 @@ export const clearDeletedReviewReceipt = async (
 			deliveryNonce: sql`lower(hex(randomblob(12)))`,
 			deliveryPreflightCompletedAt: null,
 			deliveryPostAttemptedAt: null,
+			deliveryAttemptState: "unattempted",
 			deliveryClaimToken: null,
 			deliveryClaimExpiresAt: null,
 			receiptClaimToken: null,
@@ -730,6 +744,7 @@ export const attachReviewCaseReceipt = async (
 			deliveryStatus: "delivered",
 			deliveryPreflightCompletedAt: null,
 			deliveryPostAttemptedAt: null,
+			deliveryAttemptState: "attempted",
 			deliveryClaimToken: null,
 			deliveryClaimExpiresAt: null,
 			receiptClaimToken: null,
@@ -775,8 +790,9 @@ export const releaseUnattemptedReviewDelivery = async (
 			eq(reviewCases.caseId, snapshot.caseId),
 			eq(reviewCases.guildId, snapshot.guildId),
 			eq(reviewCases.receiptClaimToken, claimToken),
-			sql`${reviewCases.reviewMessageId} IS NULL`,
-			sql`${reviewCases.deliveryPostAttemptedAt} IS NULL`
+			 sql`${reviewCases.reviewMessageId} IS NULL`,
+			sql`${reviewCases.deliveryPostAttemptedAt} IS NULL`,
+			eq(reviewCases.deliveryAttemptState, "unattempted")
 		))
 		.returning()
 	return updated ?? null
@@ -809,4 +825,124 @@ export const deferReviewReceiptReconciliation = async (
 		))
 		.returning()
 	return updated ?? null
+}
+
+export const beginReviewCardWrite = async (
+	reviewCase: ReviewCase,
+	renderedRevision: number,
+	attemptToken: string
+): Promise<ReviewCardWriteAttempt> => {
+	if (!attemptToken || !reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
+		throw new Error(`Cannot persist shared-card write attempt for ${reviewCase.caseId}`)
+	}
+	const [attempt] = await getDb()
+		.insert(reviewCardWriteAttempts)
+		.values({
+			attemptToken,
+			caseId: reviewCase.caseId,
+			guildId: reviewCase.guildId,
+			channelId: reviewCase.reviewChannelId,
+			messageId: reviewCase.reviewMessageId,
+			renderedRevision
+		})
+		.returning()
+	if (!attempt) throw new Error(`Failed to persist shared-card write attempt for ${reviewCase.caseId}`)
+	return attempt
+}
+
+export const completeReviewCardWrite = async (attemptToken: string): Promise<boolean> => {
+	const deleted = await getDb()
+		.delete(reviewCardWriteAttempts)
+		.where(eq(reviewCardWriteAttempts.attemptToken, attemptToken))
+		.returning()
+	return deleted.length === 1
+}
+
+export const listOutstandingReviewCardWrites = async (
+	guildId: string,
+	limit = 10
+): Promise<ReviewCardWriteAttempt[]> => {
+	const currentTime = new Date().toISOString()
+	return getDb()
+		.select()
+		.from(reviewCardWriteAttempts)
+		.where(and(
+			eq(reviewCardWriteAttempts.guildId, guildId),
+			sql`(${reviewCardWriteAttempts.nextAttemptAt} IS NULL OR ${reviewCardWriteAttempts.nextAttemptAt} <= ${currentTime})`,
+			sql`(${reviewCardWriteAttempts.claimExpiresAt} IS NULL OR ${reviewCardWriteAttempts.claimExpiresAt} <= ${currentTime})`
+		))
+		.orderBy(asc(reviewCardWriteAttempts.createdAt), asc(reviewCardWriteAttempts.attemptToken))
+		.limit(limit)
+}
+
+export const claimOutstandingReviewCardWrite = async (
+	attemptToken: string,
+	claimToken: string,
+	claimTimeoutMs = 120_000
+): Promise<ReviewCardWriteAttempt | null> => {
+	if (!claimToken) return null
+	const currentTime = new Date().toISOString()
+	const claimExpiresAt = new Date(Date.now() + claimTimeoutMs).toISOString()
+	const [claimed] = await getDb()
+		.update(reviewCardWriteAttempts)
+		.set({ claimToken, claimExpiresAt })
+		.where(and(
+			eq(reviewCardWriteAttempts.attemptToken, attemptToken),
+			sql`(${reviewCardWriteAttempts.claimExpiresAt} IS NULL OR ${reviewCardWriteAttempts.claimExpiresAt} <= ${currentTime})`
+		))
+		.returning()
+	return claimed ?? null
+}
+
+export const reconcileOutstandingReviewCardWrite = async (
+	attempt: ReviewCardWriteAttempt,
+	claimToken: string
+): Promise<ReviewCase | null> => {
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, attempt.caseId),
+			eq(reviewCases.guildId, attempt.guildId),
+			eq(reviewCases.reviewChannelId, attempt.channelId),
+			eq(reviewCases.reviewMessageId, attempt.messageId)
+		))
+		.returning()
+	if (!updated) return null
+	const deleted = await getDb()
+		.delete(reviewCardWriteAttempts)
+		.where(and(
+			eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
+			eq(reviewCardWriteAttempts.claimToken, claimToken)
+		))
+		.returning()
+	if (deleted.length !== 1) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
+	return updated
+}
+
+export const deferOutstandingReviewCardWrite = async (
+	attemptToken: string,
+	claimToken: string,
+	backoffMs = 60_000
+): Promise<boolean> => {
+	const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString()
+	const [updated] = await getDb()
+		.update(reviewCardWriteAttempts)
+		.set({
+			claimToken: null,
+			claimExpiresAt: null,
+			nextAttemptAt,
+			failureCount: sql`${reviewCardWriteAttempts.failureCount} + 1`
+		})
+		.where(and(
+			eq(reviewCardWriteAttempts.attemptToken, attemptToken),
+			eq(reviewCardWriteAttempts.claimToken, claimToken)
+		))
+		.returning()
+	return Boolean(updated)
 }

@@ -559,6 +559,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			spyOn(reviewData, "recordReviewCaseDecision").mockResolvedValue(mockCase)
 			spyOn(reviewData, "getReviewCase").mockResolvedValue(mockCase)
 			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(mockCase)
+			spyOn(reviewData, "beginReviewCardWrite").mockResolvedValue({} as any)
+			spyOn(reviewData, "completeReviewCardWrite").mockResolvedValue(true)
 
 			const mockInteraction = {
 				guild: { id: reviewConfig.guildId },
@@ -1052,6 +1054,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				syncedRevisionMarked = rev
 				return outOfSyncCase
 			})
+			spyOn(reviewData, "beginReviewCardWrite").mockResolvedValue({} as any)
+			spyOn(reviewData, "completeReviewCardWrite").mockResolvedValue(true)
 
 			const mockClient = {
 				rest: {
