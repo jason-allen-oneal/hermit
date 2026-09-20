@@ -811,6 +811,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			process.env.DISCORD_CLIENT_ID = "bot-hermit-1"
 			try {
 				let postCount = 0
+				let patchCount = 0
 				let markedDelivered = false
 
 				const uncertainCase: ReviewCase = {
@@ -843,6 +844,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				}
 
 				let currentCase = uncertainCase
+				spyOn(reviewData, "beginReviewCardWrite").mockResolvedValue({} as any)
+				const completeWrite = spyOn(reviewData, "completeReviewCardWrite").mockResolvedValue(true)
 				spyOn(reviewData, "listOutstandingReviewReceipts").mockResolvedValue([uncertainCase])
 				spyOn(reviewData, "claimReviewReceiptReconciliation").mockResolvedValue(uncertainCase)
 				spyOn(reviewData, "getReviewCase").mockImplementation(async () => currentCase)
@@ -857,8 +860,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 					return currentCase
 				})
-				spyOn(reviewData, "markReviewCardSynced").mockResolvedValue({
-					...currentCase, syncedCardRevision: 2
+				spyOn(reviewData, "markReviewCardSynced").mockImplementation(async () => {
+					currentCase = { ...currentCase, syncedCardRevision: 2 }
+					return currentCase
 				})
 
 				const mockClient = {
@@ -874,7 +878,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 								] }]
 							}
 						],
-						patch: async () => ({}),
+						patch: async () => { patchCount++; return {} },
 						post: async () => {
 							postCount++
 							return { id: "new-card-456" }
@@ -884,6 +888,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 
 				await recoverReviewReceipts(mockClient)
 				expect(markedDelivered).toBe(true)
+				expect(patchCount).toBe(1)
+				expect(completeWrite).toHaveBeenCalledTimes(1)
+				expect(currentCase.syncedCardRevision).toBe(currentCase.cardRevision)
 				expect(postCount).toBe(0) // Reconciled read-only without duplicate POST
 			} finally {
 				process.env.DISCORD_CLIENT_ID = origClientId

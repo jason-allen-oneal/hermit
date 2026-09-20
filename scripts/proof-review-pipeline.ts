@@ -11,6 +11,8 @@ import { setRuntimeEnv } from "../src/runtime/env.js"
 import { reviewConfig } from "../src/config/review.js"
 import {
 	createReviewCase,
+	beginReviewCardWrite,
+	claimOutstandingReviewCardWrite,
 	getReviewCase,
 	recordReviewCaseDecision,
 	markReviewCardSynced,
@@ -21,6 +23,7 @@ import {
 } from "../src/data/review.js"
 import {
 	postReviewEscalationCard,
+	recoverOutstandingReviewCardWrites,
 	syncSharedReviewCard,
 	recoverSharedCardSync
 } from "../src/services/reviewNotifier.js"
@@ -238,6 +241,32 @@ try {
 	assert(receiptIds.includes("proof-unc-old"))
 	assert(!receiptIds.includes("proof-unc-recent"))
 	console.log("Verified sendable-only delivery selection and separate uncertainty backoff.")
+
+	// Exercise the actual D1 binding with an independently persisted unresolved
+	// write. Repeated repairs cannot establish that its original I/O finished.
+	const ledgerCase = await getReviewCase(caseId)
+	assert(ledgerCase)
+	const ledgerToken = "proof-unresolved-original-write"
+	await beginReviewCardWrite(ledgerCase, ledgerCase.cardRevision, ledgerToken, 0)
+	for (let pass = 0; pass < 3; pass++) {
+		await proxy.env.DB.prepare(
+			"UPDATE review_card_write_attempts SET next_attempt_at = NULL WHERE attempt_token = ?"
+		).bind(ledgerToken).run()
+		await recoverOutstandingReviewCardWrites(mockDiscord)
+		const retained = await proxy.env.DB.prepare(
+			"SELECT claim_token, next_attempt_at, failure_count FROM review_card_write_attempts WHERE attempt_token = ?"
+		).bind(ledgerToken).first<{ claim_token: string | null; next_attempt_at: string; failure_count: number }>()
+		assert(retained)
+		assert.equal(retained.claim_token, null)
+		assert.equal(retained.failure_count, 0)
+		assert(retained.next_attempt_at > new Date().toISOString())
+		assert.equal(await claimOutstandingReviewCardWrite(ledgerToken, "stale-listed-worker"), null)
+		const repairedRow = await getReviewCase(caseId)
+		assert(repairedRow)
+		assert.equal(repairedRow.cardRevision, repairedRow.syncedCardRevision)
+	}
+	assert.equal(postCount, 1)
+	console.log("Local D1: three completed card repairs retained the unknown original write; stale due-time claims rejected; no additional POST.")
 
 	console.log("\nLocal D1 / mocked transport assertions passed. No live Worker, Discord, or model-provider run was performed.")
 } catch (error) {

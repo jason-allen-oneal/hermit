@@ -873,7 +873,10 @@ export const listOutstandingReviewCardWrites = async (
 			sql`(${reviewCardWriteAttempts.nextAttemptAt} IS NULL OR ${reviewCardWriteAttempts.nextAttemptAt} <= ${currentTime})`,
 			sql`(${reviewCardWriteAttempts.claimExpiresAt} IS NULL OR ${reviewCardWriteAttempts.claimExpiresAt} <= ${currentTime})`
 		))
-		.orderBy(asc(reviewCardWriteAttempts.createdAt), asc(reviewCardWriteAttempts.attemptToken))
+		.orderBy(
+			sql`COALESCE(${reviewCardWriteAttempts.nextAttemptAt}, ${reviewCardWriteAttempts.createdAt}) ASC`,
+			asc(reviewCardWriteAttempts.attemptToken)
+		)
 		.limit(limit)
 }
 
@@ -890,6 +893,7 @@ export const claimOutstandingReviewCardWrite = async (
 		.set({ claimToken, claimExpiresAt })
 		.where(and(
 			eq(reviewCardWriteAttempts.attemptToken, attemptToken),
+			sql`(${reviewCardWriteAttempts.nextAttemptAt} IS NULL OR ${reviewCardWriteAttempts.nextAttemptAt} <= ${currentTime})`,
 			sql`(${reviewCardWriteAttempts.claimExpiresAt} IS NULL OR ${reviewCardWriteAttempts.claimExpiresAt} <= ${currentTime})`
 		))
 		.returning()
@@ -898,8 +902,7 @@ export const claimOutstandingReviewCardWrite = async (
 
 export const reconcileOutstandingReviewCardWrite = async (
 	attempt: ReviewCardWriteAttempt,
-	claimToken: string,
-	verificationDelayMs = 120_000
+	claimToken: string
 ): Promise<ReviewCase | null> => {
 	const [updated] = await getDb()
 		.update(reviewCases)
@@ -913,42 +916,43 @@ export const reconcileOutstandingReviewCardWrite = async (
 			eq(reviewCases.caseId, attempt.caseId),
 			eq(reviewCases.guildId, attempt.guildId),
 			eq(reviewCases.reviewChannelId, attempt.channelId),
-			eq(reviewCases.reviewMessageId, attempt.messageId)
+			eq(reviewCases.reviewMessageId, attempt.messageId),
+			sql`EXISTS (SELECT 1 FROM ${reviewCardWriteAttempts}
+				WHERE ${reviewCardWriteAttempts.attemptToken} = ${attempt.attemptToken}
+				AND ${reviewCardWriteAttempts.claimToken} = ${claimToken})`
 		))
 		.returning()
-	if (!updated) return null
-	if (attempt.failureCount === 0) {
-		const [retained] = await getDb()
-			.update(reviewCardWriteAttempts)
-			.set({
-				claimToken: null,
-				claimExpiresAt: null,
-				nextAttemptAt: new Date(Date.now() + verificationDelayMs).toISOString(),
-				failureCount: 1
-			})
-			.where(and(
-				eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
-				eq(reviewCardWriteAttempts.claimToken, claimToken)
-			))
-			.returning()
-		if (!retained) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
-	} else {
-		const deleted = await getDb()
-			.delete(reviewCardWriteAttempts)
-			.where(and(
-				eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
-				eq(reviewCardWriteAttempts.claimToken, claimToken)
-			))
-			.returning()
-		if (deleted.length !== 1) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
-	}
-	return updated
+	// No number of successful repairs proves the original request has finished.
+	// Retain its independent obligation until its own acknowledgment or until
+	// its exact message identity is obsolete. The recovery lease stays held
+	// through the repair; interruption leaves it available after lease expiry.
+	return updated ?? null
+}
+
+export const retireObsoleteReviewCardWrite = async (
+	attempt: ReviewCardWriteAttempt,
+	claimToken: string
+): Promise<boolean> => {
+	const deleted = await getDb()
+		.delete(reviewCardWriteAttempts)
+		.where(and(
+			eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
+			eq(reviewCardWriteAttempts.claimToken, claimToken),
+			sql`NOT EXISTS (SELECT 1 FROM ${reviewCases}
+				WHERE ${reviewCases.caseId} = ${attempt.caseId}
+				AND ${reviewCases.guildId} = ${attempt.guildId}
+				AND ${reviewCases.reviewChannelId} = ${attempt.channelId}
+				AND ${reviewCases.reviewMessageId} = ${attempt.messageId})`
+		))
+		.returning()
+	return deleted.length === 1
 }
 
 export const deferOutstandingReviewCardWrite = async (
 	attemptToken: string,
 	claimToken: string,
-	backoffMs = 60_000
+	backoffMs = 60_000,
+	failed = true
 ): Promise<boolean> => {
 	const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString()
 	const [updated] = await getDb()
@@ -957,7 +961,9 @@ export const deferOutstandingReviewCardWrite = async (
 			claimToken: null,
 			claimExpiresAt: null,
 			nextAttemptAt,
-			failureCount: sql`${reviewCardWriteAttempts.failureCount} + 1`
+			failureCount: failed
+				? sql`${reviewCardWriteAttempts.failureCount} + 1`
+				: reviewCardWriteAttempts.failureCount
 		})
 		.where(and(
 			eq(reviewCardWriteAttempts.attemptToken, attemptToken),

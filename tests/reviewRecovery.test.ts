@@ -138,7 +138,7 @@ it("keeps repair pending when an old PATCH applies after a newer acknowledgment 
 	assert.equal((await current()).cardRevision, (await current()).syncedCardRevision)
 })
 
-it("recovers a persisted PATCH attempt without waiting for the interrupted worker", async () => {
+it("recovers an interrupted PATCH that applies after multiple completed repair passes", async () => {
 	const row = await seed({
 		reviewMessageId: MESSAGE,
 		deliveryStatus: "delivered",
@@ -191,6 +191,13 @@ it("recovers a persisted PATCH attempt without waiting for the interrupted worke
 	await recoverSharedCardSync(fake.client)
 	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
 
+	// Neither two successful repairs nor many successful repairs establish an
+	// upper bound on when the original Discord write can take effect.
+	for (let pass = 0; pass < 4; pass++) {
+		db.database.run("UPDATE review_card_write_attempts SET next_attempt_at = NULL")
+		await recoverOutstandingReviewCardWrites(fake.client)
+		assert.equal(db.database.query("SELECT count(*) AS count FROM review_card_write_attempts").get().count, 1)
+	}
 	applyOld.release()
 	await oldApplied.promise
 	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("90/100"))
@@ -204,7 +211,7 @@ it("recovers a persisted PATCH attempt without waiting for the interrupted worke
 	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
 	assert.equal(db.database.query(
 		"SELECT count(*) AS count FROM review_card_write_attempts"
-	).get().count, 0)
+	).get().count, 1)
 })
 
 it("keeps migrated unknown delivery history out of the new-send path", async () => {
@@ -227,6 +234,69 @@ it("keeps migrated unknown delivery history out of the new-send path", async () 
 	assert.equal(after.deliveryStatus, "uncertain")
 	assert.equal(after.deliveryAttemptState, "legacy_unknown")
 	assert.equal(fake.state.posts, 0)
+})
+
+it("atomically respects due times and never retires an unknown write based on failed or successful retry counts", async () => {
+	const row = await seed({
+		reviewMessageId: MESSAGE,
+		deliveryStatus: "delivered",
+		cardRevision: 2,
+		syncedCardRevision: 1
+	})
+	const attempt = await data.beginReviewCardWrite(row, 2, "write-attempt", 0)
+	const firstClaim = await data.claimOutstandingReviewCardWrite(
+		attempt.attemptToken,
+		"first-owner"
+	)
+	assert(firstClaim)
+	assert(await data.deferOutstandingReviewCardWrite(
+		attempt.attemptToken,
+		"first-owner",
+		0
+	))
+	const afterFailure = db.database.query(
+		"SELECT failure_count FROM review_card_write_attempts WHERE attempt_token = ?"
+	).get(attempt.attemptToken) as { failure_count: number }
+	assert.equal(afterFailure.failure_count, 1)
+
+	const secondClaim = await data.claimOutstandingReviewCardWrite(
+		attempt.attemptToken,
+		"second-owner"
+	)
+	assert(secondClaim)
+	const beforeStaleOwner = await current()
+	assert.equal(await data.reconcileOutstandingReviewCardWrite(firstClaim, "first-owner"), null)
+	assert.equal((await current()).cardRevision, beforeStaleOwner.cardRevision)
+	assert.equal(await data.retireObsoleteReviewCardWrite(secondClaim, "second-owner"), false)
+	assert(await data.reconcileOutstandingReviewCardWrite(secondClaim, "second-owner"))
+	assert(await data.deferOutstandingReviewCardWrite(attempt.attemptToken, "second-owner", 120_000, false))
+	const retained = db.database.query(
+		"SELECT next_attempt_at, failure_count FROM review_card_write_attempts WHERE attempt_token = ?"
+	).get(attempt.attemptToken) as { next_attempt_at: string; failure_count: number }
+	assert.equal(retained.failure_count, 1)
+	assert(retained.next_attempt_at > new Date().toISOString())
+
+	// This worker listed the row before the first repair moved its due time.
+	// The atomic claim must reject that now-stale candidate.
+	assert.equal(await data.claimOutstandingReviewCardWrite(
+		attempt.attemptToken,
+		"stale-listed-owner"
+	), null)
+	db.database.run(
+		"UPDATE review_card_write_attempts SET next_attempt_at = ? WHERE attempt_token = ?",
+		[new Date(Date.now() - 1_000).toISOString(), attempt.attemptToken]
+	)
+	const finalClaim = await data.claimOutstandingReviewCardWrite(
+		attempt.attemptToken,
+		"final-owner"
+	)
+	assert(finalClaim)
+	assert(await data.reconcileOutstandingReviewCardWrite(finalClaim, "final-owner"))
+	assert.equal(db.database.query(
+		"SELECT count(*) AS count FROM review_card_write_attempts WHERE attempt_token = ?"
+	).get(attempt.attemptToken).count, 1)
+	await data.updateReviewCase(row.caseId, { reviewMessageId: "different-receipt" })
+	assert(await data.retireObsoleteReviewCardWrite(finalClaim, "final-owner"))
 })
 
 it("recovers a shared interaction write that applies after its first recovery", async () => {

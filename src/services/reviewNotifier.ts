@@ -24,6 +24,7 @@ import {
 	markReviewPostAttemptStarted,
 	releaseUnattemptedReviewDelivery,
 	reconcileOutstandingReviewCardWrite,
+	retireObsoleteReviewCardWrite,
 	type ReviewReceiptOwner
 } from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
@@ -407,20 +408,23 @@ export async function recoverOutstandingReviewCardWrites(client: Client) {
 	const outstanding = await listOutstandingReviewCardWrites(reviewConfig.guildId, 10)
 	for (const candidate of outstanding) {
 		const claimToken = crypto.randomUUID()
-		const attempt = await claimOutstandingReviewCardWrite(candidate.attemptToken, claimToken)
-		if (!attempt) continue
 		try {
+			const attempt = await claimOutstandingReviewCardWrite(candidate.attemptToken, claimToken)
+			if (!attempt) continue
 			const reviewCase = await reconcileOutstandingReviewCardWrite(attempt, claimToken)
 			if (!reviewCase) {
-				if (!await completeReviewCardWrite(attempt.attemptToken)) {
-					throw new Error(`Could not retire obsolete shared-card write ${attempt.attemptToken}`)
+				if (!await retireObsoleteReviewCardWrite(attempt, claimToken)) {
+					throw new Error(`Lost or nonobsolete shared-card write ${attempt.attemptToken}`)
 				}
 				continue
 			}
-			await syncSharedReviewCard(client, reviewCase)
+			const synced = await syncSharedReviewCard(client, reviewCase)
+			// A successful repair does not acknowledge the original write. Keep
+			// it on the due-time-ordered queue, even after arbitrarily many passes.
+			await deferOutstandingReviewCardWrite(attempt.attemptToken, claimToken, 120_000, !synced)
 		} catch (error) {
-			console.error(`Outstanding card-write recovery failed for ${attempt.caseId}:`, error)
-			await deferOutstandingReviewCardWrite(attempt.attemptToken, claimToken).catch(
+			console.error(`Outstanding card-write recovery failed for ${candidate.caseId}:`, error)
+			await deferOutstandingReviewCardWrite(candidate.attemptToken, claimToken).catch(
 				(persistenceError) => console.error("Failed to persist card-write backoff:", persistenceError)
 			)
 		}
