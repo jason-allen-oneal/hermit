@@ -997,6 +997,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(watchlistReEscalatedCase)
 			spyOn(reviewData, "markReviewCardStaleWrite").mockResolvedValue(null)
 			spyOn(reviewData, "completeReviewCaseDelivery").mockResolvedValue(watchlistReEscalatedCase)
+			spyOn(reviewData, "beginReviewCardWrite").mockResolvedValue({} as any)
+			spyOn(reviewData, "completeReviewCardWrite").mockResolvedValue(true)
 
 			const mockClient = {
 				rest: {

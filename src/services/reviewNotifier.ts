@@ -203,6 +203,8 @@ export async function postReviewEscalationCard(
 		}
 
 		const payload = buildSharedReviewPayload(allocated)
+		const writeAttemptToken = crypto.randomUUID()
+		await beginReviewCardWrite(allocated, allocated.cardRevision, writeAttemptToken)
 
 		try {
 			await client.rest.patch(
@@ -216,6 +218,8 @@ export async function postReviewEscalationCard(
 			if (!synced) {
 				await markReviewCardStaleWrite(allocated.caseId, allocated.cardRevision)
 				await syncSharedReviewCard(client, allocated)
+			} else if (!await completeReviewCardWrite(writeAttemptToken)) {
+				throw new Error(`Failed to close re-escalation card write for ${allocated.caseId}`)
 			}
 			const completed = await completeReviewCaseDelivery(
 				allocated.caseId,
@@ -235,6 +239,7 @@ export async function postReviewEscalationCard(
 				// A confirmed deletion starts a new logical create generation. The
 				// guarded mutation rotates its nonce before any later replacement POST.
 				await clearDeletedReviewReceipt(allocated, deliveryOwner)
+				await completeReviewCardWrite(writeAttemptToken)
 				return
 			}
 			console.warn("[ReviewNotifier] Failed to refresh existing card:", patchError)

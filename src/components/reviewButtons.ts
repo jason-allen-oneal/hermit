@@ -10,6 +10,8 @@ import {
 } from "@buape/carbon"
 import { reviewConfig } from "../config/review.js"
 import {
+	beginReviewCardWrite,
+	completeReviewCardWrite,
 	markReviewCardStaleWrite,
 	markReviewCardSynced,
 	recordReviewCaseDecision
@@ -158,6 +160,10 @@ const finishReviewDecision = async (
 		interaction.message?.id === updated.reviewMessageId
 	let needsSharedSync = Boolean(updated.reviewMessageId && updated.reviewChannelId)
 	const persistenceErrors: unknown[] = []
+	const writeAttemptToken = targetsSharedCard ? crypto.randomUUID() : null
+	if (writeAttemptToken) {
+		await beginReviewCardWrite(updated, updated.cardRevision, writeAttemptToken)
+	}
 	try {
 		await interaction.update({
 			components: [buildReviewCardContainer(updated, true)],
@@ -166,7 +172,13 @@ const finishReviewDecision = async (
 		if (targetsSharedCard) {
 			const synced = await markReviewCardSynced(updated.caseId, updated.cardRevision)
 			needsSharedSync = !synced
-			if (!synced) await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)
+			if (synced && writeAttemptToken) {
+				if (!await completeReviewCardWrite(writeAttemptToken)) {
+					throw new Error(`Failed to close interaction card write for ${updated.caseId}`)
+				}
+			} else if (!synced) {
+				await markReviewCardStaleWrite(updated.caseId, updated.cardRevision)
+			}
 		}
 	} catch (error) {
 		console.warn("Failed to update review decision interaction:", error)

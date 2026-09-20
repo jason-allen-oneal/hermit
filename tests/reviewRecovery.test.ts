@@ -147,39 +147,64 @@ it("recovers a persisted PATCH attempt without waiting for the interrupted worke
 	})
 	const fake = fakeDiscord()
 	setCard(fake, { ...row, cardRevision: 1, syncedCardRevision: 1 })
-	const applied = gate()
-	const stranded = gate()
+	const started = gate()
+	const applyOld = gate()
+	const oldApplied = gate()
+	const neverAcknowledged = gate()
 	const ordinaryPatch = fake.transport.rest.patch
 	let first = true
 	fake.transport.rest.patch = async (route, options) => {
 		if (first) {
 			first = false
+			started.release()
+			await applyOld.promise
 			await ordinaryPatch(route, options)
-			applied.release()
-			await stranded.promise
+			oldApplied.release()
+			await neverAcknowledged.promise
 			return { id: MESSAGE }
 		}
 		return ordinaryPatch(route, options)
 	}
 
-	const interrupted = syncSharedReviewCard(fake.client, row)
-	await applied.promise
+	void syncSharedReviewCard(fake.client, row)
+	await started.promise
 	const pending = db.database.query(
 		"SELECT rendered_revision FROM review_card_write_attempts WHERE case_id = ?"
 	).get(row.caseId) as { rendered_revision: number }
 	assert.equal(pending.rendered_revision, 2)
+	db.database.run(
+		"UPDATE review_card_write_attempts SET next_attempt_at = ? WHERE case_id = ?",
+		[new Date(Date.now() - 1_000).toISOString(), row.caseId]
+	)
 
 	await recoverOutstandingReviewCardWrites(fake.client)
-	const repaired = await current()
-	assert.equal(repaired.syncedCardRevision, repaired.cardRevision)
+	const firstRepair = await current()
+	assert.equal(firstRepair.syncedCardRevision, firstRepair.cardRevision)
 	assert(hasStatus(fake, "ESCALATED"))
 	assert.equal(db.database.query(
 		"SELECT count(*) AS count FROM review_card_write_attempts"
-	).get().count, 0)
-
-	stranded.release()
-	await interrupted
+	).get().count, 1)
+	await data.updateReviewCase(row.caseId, {
+		heuristicScore: 99,
+		cardRevision: firstRepair.cardRevision + 1
+	})
 	await recoverSharedCardSync(fake.client)
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
+
+	applyOld.release()
+	await oldApplied.promise
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("90/100"))
+	db.database.run(
+		"UPDATE review_card_write_attempts SET next_attempt_at = ? WHERE case_id = ?",
+		[new Date(Date.now() - 1_000).toISOString(), row.caseId]
+	)
+	await recoverOutstandingReviewCardWrites(fake.client)
+	const finalRepair = await current()
+	assert.equal(finalRepair.syncedCardRevision, finalRepair.cardRevision)
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
+	assert.equal(db.database.query(
+		"SELECT count(*) AS count FROM review_card_write_attempts"
+	).get().count, 0)
 })
 
 it("keeps migrated unknown delivery history out of the new-send path", async () => {
@@ -202,6 +227,61 @@ it("keeps migrated unknown delivery history out of the new-send path", async () 
 	assert.equal(after.deliveryStatus, "uncertain")
 	assert.equal(after.deliveryAttemptState, "legacy_unknown")
 	assert.equal(fake.state.posts, 0)
+})
+
+it("recovers a shared interaction write that applies after its first recovery", async () => {
+	const row = await seed({
+		reviewMessageId: MESSAGE,
+		deliveryStatus: "delivered",
+		cardRevision: 1,
+		syncedCardRevision: 1
+	})
+	const fake = fakeDiscord()
+	setCard(fake, row)
+	const started = gate()
+	const applyOld = gate()
+	const oldApplied = gate()
+	const neverAcknowledged = gate()
+	const sharedInteraction = interaction(fake, async (options) => {
+		started.release()
+		await applyOld.promise
+		fake.cards.set(MESSAGE, {
+			...serializePayload(options),
+			id: MESSAGE,
+			channel_id: reviewConfig.reviewChannelId,
+			author: { id: BOT, bot: true }
+		})
+		oldApplied.release()
+		await neverAcknowledged.promise
+	})
+
+	void new ReviewDismissButton().run(sharedInteraction, {
+		caseId: row.caseId,
+		rev: row.cardRevision
+	})
+	await started.promise
+	db.database.run(
+		"UPDATE review_card_write_attempts SET next_attempt_at = ? WHERE case_id = ?",
+		[new Date(Date.now() - 1_000).toISOString(), row.caseId]
+	)
+	await recoverOutstandingReviewCardWrites(fake.client)
+	const firstRepair = await current()
+	await data.updateReviewCase(row.caseId, {
+		heuristicScore: 99,
+		cardRevision: firstRepair.cardRevision + 1
+	})
+	await recoverSharedCardSync(fake.client)
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
+
+	applyOld.release()
+	await oldApplied.promise
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("90/100"))
+	db.database.run(
+		"UPDATE review_card_write_attempts SET next_attempt_at = ? WHERE case_id = ?",
+		[new Date(Date.now() - 1_000).toISOString(), row.caseId]
+	)
+	await recoverOutstandingReviewCardWrites(fake.client)
+	assert(JSON.stringify(fake.cards.get(MESSAGE)).includes("99/100"))
 })
 
 const buttons = [

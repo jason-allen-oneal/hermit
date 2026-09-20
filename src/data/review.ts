@@ -830,7 +830,8 @@ export const deferReviewReceiptReconciliation = async (
 export const beginReviewCardWrite = async (
 	reviewCase: ReviewCase,
 	renderedRevision: number,
-	attemptToken: string
+	attemptToken: string,
+	initialDelayMs = 120_000
 ): Promise<ReviewCardWriteAttempt> => {
 	if (!attemptToken || !reviewCase.reviewChannelId || !reviewCase.reviewMessageId) {
 		throw new Error(`Cannot persist shared-card write attempt for ${reviewCase.caseId}`)
@@ -843,7 +844,8 @@ export const beginReviewCardWrite = async (
 			guildId: reviewCase.guildId,
 			channelId: reviewCase.reviewChannelId,
 			messageId: reviewCase.reviewMessageId,
-			renderedRevision
+			renderedRevision,
+			nextAttemptAt: new Date(Date.now() + initialDelayMs).toISOString()
 		})
 		.returning()
 	if (!attempt) throw new Error(`Failed to persist shared-card write attempt for ${reviewCase.caseId}`)
@@ -896,7 +898,8 @@ export const claimOutstandingReviewCardWrite = async (
 
 export const reconcileOutstandingReviewCardWrite = async (
 	attempt: ReviewCardWriteAttempt,
-	claimToken: string
+	claimToken: string,
+	verificationDelayMs = 120_000
 ): Promise<ReviewCase | null> => {
 	const [updated] = await getDb()
 		.update(reviewCases)
@@ -914,14 +917,31 @@ export const reconcileOutstandingReviewCardWrite = async (
 		))
 		.returning()
 	if (!updated) return null
-	const deleted = await getDb()
-		.delete(reviewCardWriteAttempts)
-		.where(and(
-			eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
-			eq(reviewCardWriteAttempts.claimToken, claimToken)
-		))
-		.returning()
-	if (deleted.length !== 1) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
+	if (attempt.failureCount === 0) {
+		const [retained] = await getDb()
+			.update(reviewCardWriteAttempts)
+			.set({
+				claimToken: null,
+				claimExpiresAt: null,
+				nextAttemptAt: new Date(Date.now() + verificationDelayMs).toISOString(),
+				failureCount: 1
+			})
+			.where(and(
+				eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
+				eq(reviewCardWriteAttempts.claimToken, claimToken)
+			))
+			.returning()
+		if (!retained) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
+	} else {
+		const deleted = await getDb()
+			.delete(reviewCardWriteAttempts)
+			.where(and(
+				eq(reviewCardWriteAttempts.attemptToken, attempt.attemptToken),
+				eq(reviewCardWriteAttempts.claimToken, claimToken)
+			))
+			.returning()
+		if (deleted.length !== 1) throw new Error(`Lost shared-card write ownership for ${attempt.caseId}`)
+	}
 	return updated
 }
 
