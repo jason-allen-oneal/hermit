@@ -106,13 +106,15 @@ command, relevant output, inspected artifact, and these explicit limits.
 
 `bun --no-env-file scripts/proof-review-interactions.ts --live` is a separate
 opt-in ingress runner, not a claim of a completed run. It requires the same test
-configuration plus `HERMIT_PROOF_ACTOR_IDS` (comma-separated authorized owners).
+configuration plus `HERMIT_PROOF_ACTOR_IDS` (comma-separated authorized owners) and
+`HERMIT_PROOF_STAFF_ROLE_ID` (operator-created zero-permission test role).
 It refuses an existing guild `/review` command or an application with an HTTP
-interaction endpoint. It adds only its own temporary guild command and a new
-zero-permission role, mapping that role as staff inside the test process. The
-actual actor starts without that role. After a genuine rejected command, the
-runner adds the role to that actor for the authorized control. It deletes only
-its own command and role in `finally`, including failure/timeout cleanup.
+interaction endpoint. It adds only its own temporary guild command and maps the existing test role
+as staff inside the test process. The actual actor starts without that role.
+After a genuine rejected command, the owner assigns the role through Discord
+for the authorized control. It deletes its own command in `finally`, including
+failure/timeout cleanup. The owner must remove the temporary role afterward;
+the bot is not granted role-management privileges.
 
 It uses a separate zero-intent Carbon Gateway connection, listens only for test
 channel/actor interactions, and passes their actual payloads unchanged to the

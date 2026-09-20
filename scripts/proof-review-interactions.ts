@@ -1,5 +1,5 @@
 /** Opt-in actual Discord Gateway command/button ingress; never deployed.
- * Temporary test-guild command and zero-permission role are removed in finally.
+ * Own temporary test-guild command is removed in finally; operator owns test-role lifecycle.
  * Local D1, synthetic Discrawl, unchanged Carbon router/ReviewCommand/buttons.
  */
 import assert from "node:assert/strict"
@@ -40,7 +40,9 @@ const {buildReviewProofFixture} = await import("./lib/reviewProofFixture.js")
 const {applyReviewMigrations} = await import("./lib/reviewMigrationProof.js")
 const {startDiscrawlServer} = await import("../forwarder/src/discrawlServer.js")
 let cleanupD1: (()=>Promise<void>)|undefined, stopBridge: (()=>void)|undefined
-let commandId:string|undefined, roleId:string|undefined, timer: ReturnType<typeof setTimeout>|undefined
+const roleId=process.env.HERMIT_PROOF_STAFF_ROLE_ID
+assert(roleId && /^[1-9][0-9]{16,19}$/.test(roleId),"Supply externally managed zero-permission test role")
+let commandId:string|undefined, timer: ReturnType<typeof setTimeout>|undefined
 let stage=0, actor:string|undefined, staleMessageId:string|undefined, sharedId:string|undefined
 let resolveDone!:()=>void, rejectDone!:(error:unknown)=>void
 const done=new Promise<void>((resolve,reject)=>{resolveDone=resolve;rejectDone=reject})
@@ -73,8 +75,7 @@ class ProofListener extends InteractionCreateListener {
     assert(responseText.includes("Staff role required")); assert.equal(await data.getReviewCase(caseId),null)
     actor=raw.member.user.id
     await emit("real_nonstaff_command_rejected",{caseCreated:false})
-    await client.rest.put(`/guilds/${config.guildId}/members/${actor}/roles/${roleId}`)
-    stage=1;await emit("awaiting_authorized_review_command")
+    stage=1;await emit("awaiting_external_test_role_assignment_then_authorized_review_command")
    } else if(stage===1) {
     assert(raw.member.roles.includes(roleId))
     let current=await data.getReviewCase(caseId);assert(current?.status==="escalated")
@@ -124,7 +125,8 @@ try {
  await writeFile(fixturePath,JSON.stringify(buildReviewProofFixture({guildId:config.guildId,channelId:config.channelId,targetUserId:config.botId,nowMs:Date.now()})),{mode:0o600})
  const secret=randomUUID()+randomUUID();const bridge=startDiscrawlServer({exportPath:fixturePath,secret,port:0});stopBridge=()=>bridge.stop(true)
  delete process.env.DISCRAWL_EXPORT_PATH;process.env.DISCRAWL_EXPORT_URL=`http://127.0.0.1:${bridge.port}`;process.env.DISCRAWL_SECRET=secret;process.env.ENABLE_AUTOMATIC_SCREENING="false"
- const role:any=await client.rest.post(`/guilds/${config.guildId}/roles`,{body:{name:"Hermit synthetic proof staff",permissions:"0",mentionable:false,hoist:false}});roleId=role.id
+ const roles:any=await client.rest.get(`/guilds/${config.guildId}/roles`)
+ const role=roles.find((entry:any)=>entry.id===roleId);assert(role && role.permissions==="0","Test role must exist with zero permissions")
  Object.assign(reviewConfig,{guildId:config.guildId,reviewChannelId:config.channelId,staffRoleIds:[roleId]})
  const registered:any=await client.rest.post(commandRoute,{body:command.serialize()});commandId=registered.id
  await gateway.registerClient(client)
@@ -133,16 +135,15 @@ try {
  await done
  await emit("passed",{actualCommands:2,actualButtons:2,realPermissionRejection:true,realStaleRejection:true})
 } catch(error) {
- await emit("failed",{stage,errorType:error instanceof Error?error.name:"unknown"})
+ await emit("failed",{stage,errorType:error instanceof Error?error.name:"unknown",status:typeof (error as any)?.status==="number"?(error as any).status:null,code:typeof (error as any)?.code==="number"?(error as any).code:null})
  process.exitCode=1
 } finally {
  if(timer)clearTimeout(timer)
  gateway.disconnect()
  let cleanupFailed=false
  if(commandId)try{await client.rest.delete(`/applications/${config.botId}/guilds/${config.guildId}/commands/${commandId}`)}catch{cleanupFailed=true}
- if(roleId)try{await client.rest.delete(`/guilds/${config.guildId}/roles/${roleId}`)}catch{cleanupFailed=true}
  stopBridge?.();await cleanupD1?.()
- await emit("cleanup",{temporaryCommandAndRoleRemoved:!cleanupFailed})
+ await emit("cleanup",{temporaryCommandRemoved:!cleanupFailed,externalTestRoleCleanupRequired:true})
  if(cleanupFailed)process.exitCode=1
  console.log(`Private evidence retained at ${root}`)
 }
