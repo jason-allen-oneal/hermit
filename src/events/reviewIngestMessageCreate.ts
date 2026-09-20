@@ -142,6 +142,11 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 							behavioralFamilies: JSON.stringify(
 								Object.keys(report.familyScores)
 							),
+							keySignals: JSON.stringify(report.signals.slice(0, 3).map((signal) => ({
+								code: signal.code,
+								family: signal.family,
+								description: signal.description
+							}))),
 							evidenceMessageId: data.id,
 							krillProbability: krill
 								? `${(krill.automationProbability * 100).toFixed(1)}%`
@@ -156,7 +161,7 @@ export default class ReviewIngestMessageCreate extends MessageCreateListener {
 							createdCase.status === "escalated" &&
 							createdCase.deliveryStatus === "pending"
 						) {
-							await postReviewEscalationCard(client, createdCase, report, krill)
+							await postReviewEscalationCard(client, createdCase)
 						}
 					}
 				}

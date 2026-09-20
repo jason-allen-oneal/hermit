@@ -484,6 +484,7 @@ export const reviewCases = sqliteTable(
 		heuristicScore: integer("heuristic_score").notNull(),
 		concordance: text().notNull(),
 		behavioralFamilies: text("behavioral_families").notNull(),
+		keySignals: text("key_signals").notNull().default("[]"),
 		evidenceMessageId: text("evidence_message_id"),
 		krillProbability: text("krill_probability"),
 		krillBrief: text("krill_brief"),
@@ -492,8 +493,19 @@ export const reviewCases = sqliteTable(
 		reviewChannelId: text("review_channel_id"),
 		deliveryStatus: text("delivery_status").notNull().default("pending"),
 		previousDeliveryStatus: text("previous_delivery_status").notNull().default("pending"),
+		deliveryNonce: text("delivery_nonce"),
+		deliveryPreflightCompletedAt: text("delivery_preflight_completed_at"),
+		deliveryPostAttemptedAt: text("delivery_post_attempted_at"),
+		deliveryClaimToken: text("delivery_claim_token"),
+		deliveryClaimExpiresAt: text("delivery_claim_expires_at"),
+		receiptClaimToken: text("receipt_claim_token"),
+		receiptClaimExpiresAt: text("receipt_claim_expires_at"),
+		receiptNextAttemptAt: text("receipt_next_attempt_at"),
+		receiptHistoryBefore: text("receipt_history_before"),
 		cardRevision: integer("card_revision").notNull().default(1),
 		syncedCardRevision: integer("synced_card_revision").notNull().default(1),
+		cardSyncNextAttemptAt: text("card_sync_next_attempt_at"),
+		cardSyncFailureCount: integer("card_sync_failure_count").notNull().default(0),
 		expiresAt: text("expires_at"),
 		decidedById: text("decided_by_id"),
 		decisionReason: text("decision_reason"),
@@ -507,7 +519,18 @@ export const reviewCases = sqliteTable(
 	(table) => [
 		index("idx_review_cases_guild_target").on(table.guildId, table.targetUserId),
 		index("idx_review_cases_status").on(table.status),
-		index("idx_review_cases_review_msg").on(table.reviewMessageId)
+		index("idx_review_cases_review_msg").on(table.reviewMessageId),
+		index("idx_review_cases_receipt_recovery").on(
+			table.guildId,
+			table.deliveryStatus,
+			table.receiptNextAttemptAt,
+			table.receiptClaimExpiresAt
+		),
+		index("idx_review_cases_card_sync_due").on(
+			table.cardSyncNextAttemptAt,
+			table.cardRevision,
+			table.syncedCardRevision
+		)
 	]
 )
 
@@ -543,4 +566,3 @@ export type ReviewObservation = typeof reviewObservations.$inferSelect
 export type NewReviewObservation = typeof reviewObservations.$inferInsert
 export type ReviewCase = typeof reviewCases.$inferSelect
 export type NewReviewCase = typeof reviewCases.$inferInsert
-

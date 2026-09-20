@@ -20,6 +20,7 @@ import { reviewConfig } from "../src/config/review.js"
 import * as reviewData from "../src/data/review.js"
 import {
 	postReviewEscalationCard,
+	recoverReviewReceipts,
 	recoverSharedCardSync,
 	syncSharedReviewCard
 } from "../src/services/reviewNotifier.js"
@@ -30,6 +31,10 @@ import type { AnalysisReport, ReviewMessage } from "../src/review/types.js"
 const TEST_KEY = "test-secret-key-that-is-at-least-32-chars-long"
 
 describe("Claw & Order / Hermit Review Pipeline", () => {
+	afterEach(() => {
+		mock.restore()
+	})
+
 	describe("Feature Extraction (features.ts)", () => {
 		it("extracts AI thought streams and marks execution-marker & ai-formatting", () => {
 			const thoughtContent = `> 🧠 **Thinking Process**\n> 1. Formulate step\n> 2. Plan action\n\nHere is the resolution:\n* **Step 1:** Run check\n* **Step 2:** Verify output`
@@ -307,6 +312,11 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				heuristicScore: 95,
 				concordance: "High",
 				behavioralFamilies: JSON.stringify(["timing", "stylometry"]),
+				keySignals: JSON.stringify([{
+					code: "rapid-response-speed",
+					family: "timing",
+					description: "Sustained response speed exceeds the configured threshold."
+				}]),
 				evidenceMessageId: "m1",
 				krillProbability: "99.4%",
 				krillBrief: "Autonomous agent execution confirmed.",
@@ -314,6 +324,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewMessageId: null,
 				reviewChannelId: "1519064274561929328",
 				deliveryStatus: "pending",
+				previousDeliveryStatus: null,
+				cardRevision: 1,
+				syncedCardRevision: 0,
 				expiresAt: null,
 				decidedById: null,
 				decisionReason: null,
@@ -321,9 +334,13 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
-			const container = buildReviewCardContainer(reviewCase, null, null, false)
+			const container = buildReviewCardContainer(reviewCase, false)
 			expect(container).toBeDefined()
 			expect(container.components.length).toBeGreaterThan(3)
+			expect(container.components.some((component) =>
+				component instanceof TextDisplay &&
+				(component as any).content?.includes("Key Detected Signals")
+			)).toBe(true)
 		})
 
 		it("displays watchlist expiration timestamp when on watchlist", () => {
@@ -337,6 +354,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				heuristicScore: 80,
 				concordance: "High",
 				behavioralFamilies: JSON.stringify(["timing"]),
+				keySignals: "[]",
 				evidenceMessageId: "m2",
 				krillProbability: "85%",
 				krillBrief: "Watchlist evaluation.",
@@ -351,7 +369,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
-			const container = buildReviewCardContainer(reviewCase, null, null, true)
+			const container = buildReviewCardContainer(reviewCase, true)
 			const statusDisplay = container.components.find(
 				(c) => c instanceof TextDisplay && (c as any).content?.includes("WATCHLIST")
 			)
@@ -363,25 +381,26 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 		const staffRoleId = reviewConfig.staffRoleIds[0]
 
 		it("configures distinct customIds and defer=false across all actions", () => {
-			const dismiss = new ReviewDismissButton("case-101")
-			const watchlist = new ReviewWatchlistButton("case-101")
-			const confirmBot = new ReviewConfirmBotButton("case-101")
+			const dismiss = new ReviewDismissButton("case-101", 7)
+			const watchlist = new ReviewWatchlistButton("case-101", 7)
+			const confirmBot = new ReviewConfirmBotButton("case-101", 7)
 
-			expect(dismiss.customId).toBe("review-dismiss:caseId=case-101")
+			expect(dismiss.customId).toBe("review-dismiss:caseId=case-101;rev=7")
 			expect(dismiss.defer).toBe(false)
 
-			expect(watchlist.customId).toBe("review-watchlist:caseId=case-101")
+			expect(watchlist.customId).toBe("review-watchlist:caseId=case-101;rev=7")
 			expect(watchlist.defer).toBe(false)
 
-			expect(confirmBot.customId).toBe("review-confirm-bot:caseId=case-101")
+			expect(confirmBot.customId).toBe("review-confirm-bot:caseId=case-101;rev=7")
 			expect(confirmBot.defer).toBe(false)
 		})
 
 		it("rejects non-staff interactions with Carbon Container notice", async () => {
-			const dismiss = new ReviewDismissButton("case-101")
+			const dismiss = new ReviewDismissButton("case-101", 1)
 			let repliedPayload: any = null
 
 			const mockInteraction = {
+				guild: { id: reviewConfig.guildId },
 				member: { roles: [{ id: "unrelated-role" }] },
 				user: { id: "non-staff-user" },
 				userId: "non-staff-user",
@@ -390,7 +409,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				}
 			} as unknown as any
 
-			await dismiss.run(mockInteraction, { caseId: "case-101" })
+			await dismiss.run(mockInteraction, { caseId: "case-101", rev: 1 })
 
 			expect(repliedPayload).toBeDefined()
 			expect(repliedPayload.ephemeral).toBe(true)
@@ -399,13 +418,13 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 		})
 
 		it("dismisses case for staff and updates card without deferring", async () => {
-			const dismiss = new ReviewDismissButton("case-101")
+			const dismiss = new ReviewDismissButton("case-101", 1)
 			let updateCaseArgs: any = null
 			let updatedMessagePayload: any = null
 
 			spyOn(reviewData, "recordReviewCaseDecision").mockImplementation(
-				async (caseId, decision) => {
-					updateCaseArgs = { caseId, update: decision }
+				async (caseId, guildId, expectedRevision, decision) => {
+					updateCaseArgs = { caseId, guildId, expectedRevision, update: decision }
 					return {
 						id: 1,
 						caseId,
@@ -435,6 +454,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			)
 
 			const mockInteraction = {
+				guild: { id: reviewConfig.guildId },
 				member: { roles: [{ id: staffRoleId }] },
 				user: { id: "staff-1" },
 				userId: "staff-1",
@@ -443,9 +463,11 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				}
 			} as unknown as any
 
-			await dismiss.run(mockInteraction, { caseId: "case-101" })
+			await dismiss.run(mockInteraction, { caseId: "case-101", rev: 1 })
 
 			expect(updateCaseArgs.caseId).toBe("case-101")
+			expect(updateCaseArgs.guildId).toBe(reviewConfig.guildId)
+			expect(updateCaseArgs.expectedRevision).toBe(1)
 			expect(updateCaseArgs.update.status).toBe("dismissed")
 			expect(updateCaseArgs.update.expiresAt).toBeNull()
 			expect(updatedMessagePayload).toBeDefined()
@@ -453,12 +475,12 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 		})
 
 		it("places case on 7-day watchlist with expiration timestamp", async () => {
-			const watchlist = new ReviewWatchlistButton("case-202")
+			const watchlist = new ReviewWatchlistButton("case-202", 1)
 			let updateCaseArgs: any = null
 
 			spyOn(reviewData, "recordReviewCaseDecision").mockImplementation(
-				async (caseId, decision) => {
-					updateCaseArgs = { caseId, update: decision }
+				async (caseId, guildId, expectedRevision, decision) => {
+					updateCaseArgs = { caseId, guildId, expectedRevision, update: decision }
 					return {
 						id: 2,
 						caseId,
@@ -488,13 +510,14 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			)
 
 			const mockInteraction = {
+				guild: { id: reviewConfig.guildId },
 				member: { roles: [{ id: staffRoleId }] },
 				user: { id: "staff-1" },
 				userId: "staff-1",
 				update: async () => {}
 			} as unknown as any
 
-			await watchlist.run(mockInteraction, { caseId: "case-202" })
+			await watchlist.run(mockInteraction, { caseId: "case-202", rev: 1 })
 
 			expect(updateCaseArgs.caseId).toBe("case-202")
 			expect(updateCaseArgs.update.status).toBe("watchlist")
@@ -504,7 +527,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 		})
 
 		it("synchronizes shared review card when decided from an ephemeral command card", async () => {
-			const confirmBot = new ReviewConfirmBotButton("case-303")
+			const confirmBot = new ReviewConfirmBotButton("case-303", 1)
 			let patchedMessageRoute: string | null = null
 			let patchedPayload: any = null
 
@@ -538,6 +561,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(mockCase)
 
 			const mockInteraction = {
+				guild: { id: reviewConfig.guildId },
 				member: { roles: [{ id: staffRoleId }] },
 				user: { id: "staff-1" },
 				userId: "staff-1",
@@ -554,7 +578,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				update: async () => {}
 			} as unknown as any
 
-			await confirmBot.run(mockInteraction, { caseId: "case-303" })
+			await confirmBot.run(mockInteraction, { caseId: "case-303", rev: 1 })
 
 			expect(patchedMessageRoute).toContain("shared-channel-msg-999")
 			expect(patchedPayload).toBeDefined()
@@ -721,7 +745,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
-			await postReviewEscalationCard(mockClient, foreignCase, null, null)
+			await postReviewEscalationCard(mockClient, foreignCase)
 			expect(postCalled).toBe(false)
 		})
 
@@ -744,6 +768,11 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewMessageId: null,
 				reviewChannelId: null,
 				deliveryStatus: "pending",
+				deliveryClaimToken: "delivery-token",
+				deliveryNonce: "stable-nonce",
+				previousDeliveryStatus: "pending",
+				cardRevision: 1,
+				syncedCardRevision: 1,
 				expiresAt: null,
 				decidedById: null,
 				decisionReason: null,
@@ -752,9 +781,14 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			}
 
 			spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(validCase)
-			spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-				if (update.deliveryStatus) updatedStatus = update.deliveryStatus
-				return null
+			spyOn(reviewData, "getReviewCase").mockResolvedValue(validCase)
+			spyOn(reviewData, "markReviewPostAttemptStarted").mockResolvedValue({
+				...validCase,
+				deliveryPostAttemptedAt: new Date().toISOString()
+			})
+			spyOn(reviewData, "deferClaimedReviewDeliveryReceipt").mockImplementation(async () => {
+				updatedStatus = "uncertain"
+				return { ...validCase, deliveryStatus: "uncertain" }
 			})
 
 			const mockClient = {
@@ -766,7 +800,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				}
 			} as unknown as any
 
-			await postReviewEscalationCard(mockClient, validCase, null, null)
+			await postReviewEscalationCard(mockClient, validCase)
 			expect(updatedStatus).toBe("uncertain")
 		})
 
@@ -794,6 +828,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					reviewChannelId: reviewConfig.reviewChannelId,
 					deliveryStatus: "uncertain",
 					previousDeliveryStatus: "uncertain",
+					deliveryClaimToken: "delivery-token",
+					deliveryNonce: "stable-nonce",
+					deliveryPostAttemptedAt: new Date(Date.now() - 180_000).toISOString(),
 					cardRevision: 1,
 					syncedCardRevision: 1,
 					expiresAt: null,
@@ -803,12 +840,23 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					updatedAt: new Date().toISOString()
 				}
 
-				spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
-				spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-					if (update.deliveryStatus === "delivered" && update.reviewMessageId === "existing-card-123") {
-						markedDelivered = true
+				let currentCase = uncertainCase
+				spyOn(reviewData, "listOutstandingReviewReceipts").mockResolvedValue([uncertainCase])
+				spyOn(reviewData, "claimReviewReceiptReconciliation").mockResolvedValue(uncertainCase)
+				spyOn(reviewData, "getReviewCase").mockImplementation(async () => currentCase)
+				spyOn(reviewData, "attachReviewCaseReceipt").mockImplementation(async () => {
+					markedDelivered = true
+					currentCase = {
+						...uncertainCase,
+						reviewMessageId: "existing-card-123",
+						deliveryStatus: "delivered",
+						cardRevision: 2,
+						syncedCardRevision: 1
 					}
-					return null
+					return currentCase
+				})
+				spyOn(reviewData, "markReviewCardSynced").mockResolvedValue({
+					...currentCase, syncedCardRevision: 2
 				})
 
 				const mockClient = {
@@ -816,10 +864,15 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 						get: async () => [
 							{
 								id: "existing-card-123",
+								channel_id: reviewConfig.reviewChannelId,
 								author: { id: "bot-hermit-1", bot: true },
-								components: [{ content: "🦞 Claw & Order | Automation Review\ncaseId=case-uncertain-1\ntarget-user-rec" }]
+								components: [{ type: 17, components: [
+									{ type: 10, content: "### 🦞 Claw & Order | Automation Review" },
+									{ type: 10, content: "-# hermit-review:v1:case-uncertain-1" }
+								] }]
 							}
 						],
+						patch: async () => ({}),
 						post: async () => {
 							postCount++
 							return { id: "new-card-456" }
@@ -827,7 +880,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 				} as unknown as any
 
-				await postReviewEscalationCard(mockClient, uncertainCase, null, null)
+				await recoverReviewReceipts(mockClient)
 				expect(markedDelivered).toBe(true)
 				expect(postCount).toBe(0) // Reconciled read-only without duplicate POST
 			} finally {
@@ -859,6 +912,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					reviewChannelId: reviewConfig.reviewChannelId,
 					deliveryStatus: "uncertain",
 					previousDeliveryStatus: "uncertain",
+					deliveryClaimToken: "delivery-token",
+					deliveryNonce: "stable-nonce",
+					deliveryPostAttemptedAt: new Date(Date.now() - 180_000).toISOString(),
 					cardRevision: 1,
 					syncedCardRevision: 1,
 					expiresAt: null,
@@ -868,19 +924,16 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					updatedAt: new Date().toISOString()
 				}
 
-				spyOn(reviewData, "claimReviewCaseDelivery").mockResolvedValue(uncertainCase)
-				spyOn(reviewData, "updateReviewCase").mockImplementation(async (caseId, update) => {
-					if (update.deliveryStatus === "delivered") {
-						markedDelivered = true
-					}
-					return null
-				})
+				spyOn(reviewData, "listOutstandingReviewReceipts").mockResolvedValue([uncertainCase])
+				spyOn(reviewData, "claimReviewReceiptReconciliation").mockResolvedValue(uncertainCase)
+				spyOn(reviewData, "deferReviewReceiptReconciliation").mockResolvedValue(uncertainCase)
 
 				const mockClient = {
 					rest: {
 						get: async () => [
 							{
 								id: "foreign-card-789",
+								channel_id: reviewConfig.reviewChannelId,
 								author: { id: "foreign-bot-999", bot: true },
 								components: [{ content: "🦞 Claw & Order | Automation Review\ncaseId=case-foreign-bot\ntarget-user-rec" }]
 							}
@@ -892,7 +945,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 				} as unknown as any
 
-				await postReviewEscalationCard(mockClient, uncertainCase, null, null)
+				await recoverReviewReceipts(mockClient)
 				expect(markedDelivered).toBe(false)
 				expect(postCount).toBe(0) // Uncertain status preserved without duplicate post
 			} finally {
@@ -922,6 +975,8 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				reviewChannelId: reviewConfig.reviewChannelId,
 				deliveryStatus: "delivered",
 				previousDeliveryStatus: "pending",
+				deliveryClaimToken: "delivery-token",
+				deliveryNonce: "stable-nonce",
 				cardRevision: 2,
 				syncedCardRevision: 2,
 				expiresAt: null,
@@ -939,7 +994,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			spyOn(reviewData, "getReviewCase").mockResolvedValue(watchlistReEscalatedCase)
 			spyOn(reviewData, "markReviewCardSynced").mockResolvedValue(watchlistReEscalatedCase)
 			spyOn(reviewData, "markReviewCardStaleWrite").mockResolvedValue(null)
-			spyOn(reviewData, "updateReviewCase").mockResolvedValue(null as any)
+			spyOn(reviewData, "completeReviewCaseDelivery").mockResolvedValue(watchlistReEscalatedCase)
 
 			const mockClient = {
 				rest: {
@@ -955,7 +1010,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				}
 			} as unknown as any
 
-			await postReviewEscalationCard(mockClient, watchlistReEscalatedCase, null, null)
+			await postReviewEscalationCard(mockClient, watchlistReEscalatedCase)
 			expect(patchCalled).toBe(true)
 			expect(patchedMessageId).toContain("existing-watchlist-card-msg")
 			expect(postCalled).toBe(false)
@@ -1048,7 +1103,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				updatedAt: new Date().toISOString()
 			}
 
-			await postReviewEscalationCard(mockClient, dismissedCase, null, null)
+			await postReviewEscalationCard(mockClient, dismissedCase)
 			expect(postCalled).toBe(false)
 		})
 	})
@@ -1158,10 +1213,9 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					heuristicScore: 90,
 					concordance: "High",
 					behavioralFamilies: "[]",
-					deliveryStatus: "uncertain"
+					deliveryStatus: "uncertain",
+					deliveryPostAttemptedAt: new Date(Date.now() - 180_000).toISOString()
 				})
-
-				const dbCase = (await reviewData.getReviewCase("case-d1-uncertain"))!
 
 				let postCount = 0
 				const mockClient = {
@@ -1174,13 +1228,13 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 				} as unknown as any
 
-				await postReviewEscalationCard(mockClient, dbCase, null, null)
+				await recoverReviewReceipts(mockClient)
 
 				// Uncertainty preserved; no duplicate send
 				expect(postCount).toBe(0)
 				const inDb = await reviewData.getReviewCase("case-d1-uncertain")
 				expect(inDb!.deliveryStatus).toBe("uncertain")
-				expect(inDb!.previousDeliveryStatus).toBe("uncertain")
+				expect(inDb!.previousDeliveryStatus).toBe("pending")
 			} finally {
 				process.env.DISCORD_CLIENT_ID = origClientId
 			}
@@ -1198,18 +1252,21 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					[reviewConfig.guildId, staleTime]
 				)
 
-				const dbCase = (await reviewData.getReviewCase("case-d1-stale"))!
-
 				let postCount = 0
 				const mockClient = {
 					rest: {
 						get: async () => [
 							{
 								id: "found-card-msg-123",
+								channel_id: reviewConfig.reviewChannelId,
 								author: { id: "bot-hermit-1", bot: true },
-								components: [{ content: `caseId=case-d1-stale\nuser-d1-2` }]
+								components: [{ type: 17, components: [
+									{ type: 10, content: "### 🦞 Claw & Order | Automation Review" },
+									{ type: 10, content: "-# hermit-review:v1:case-d1-stale" }
+								] }]
 							}
 						],
+						patch: async () => ({}),
 						post: async () => {
 							postCount++
 							return { id: "unexpected" }
@@ -1217,7 +1274,7 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 				} as unknown as any
 
-				await postReviewEscalationCard(mockClient, dbCase, null, null)
+				await recoverReviewReceipts(mockClient)
 
 				expect(postCount).toBe(0)
 				const inDb = await reviewData.getReviewCase("case-d1-stale")
@@ -1346,21 +1403,37 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				cardRevision: 1
 			})
 
-			const allocated = await reviewData.allocateReescalationRevision("case-reesc-atomic")
+			const claimed = await reviewData.claimReviewCaseDelivery(
+				"case-reesc-atomic",
+				reviewConfig.guildId
+			)
+			expect(claimed?.deliveryClaimToken).toBeDefined()
+			const allocated = await reviewData.allocateReescalationRevision(
+				"case-reesc-atomic",
+				claimed!.deliveryClaimToken!
+			)
 			expect(allocated).not.toBeNull()
 			expect(allocated!.cardRevision).toBe(2)
 			expect(allocated!.deliveryStatus).toBe("delivering")
 
 			// If staff intervenes and dismisses the case
-			await reviewData.recordReviewCaseDecision("case-reesc-atomic", {
+			await reviewData.recordReviewCaseDecision(
+				"case-reesc-atomic",
+				reviewConfig.guildId,
+				allocated!.cardRevision,
+				{
 				status: "dismissed",
 				expiresAt: null,
 				decidedById: "staff-1",
 				decisionReason: "dismissed"
-			})
+				}
+			)
 
 			// Subsequent re-escalation attempt fails because status is dismissed
-			const rejected = await reviewData.allocateReescalationRevision("case-reesc-atomic")
+			const rejected = await reviewData.allocateReescalationRevision(
+				"case-reesc-atomic",
+				claimed!.deliveryClaimToken!
+			)
 			expect(rejected).toBeNull()
 		})
 
@@ -1382,23 +1455,36 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 				})
 
 				const initialCase = (await reviewData.getReviewCase("case-receipt-rev"))!
+				d1Owner.database.run(
+					"UPDATE review_cases SET updated_at = ? WHERE case_id = ?",
+					[new Date(Date.now() - 180_000).toISOString(), initialCase.caseId]
+				)
 
 				let patchCalled = false
 				const mockClient = {
 					rest: {
 						get: async () => {
 							// Staff dismisses the case WHILE history is awaited (bumping cardRevision to 2)
-							await reviewData.recordReviewCaseDecision("case-receipt-rev", {
-								status: "dismissed",
-								expiresAt: null,
-								decidedById: "staff-quick",
-								decisionReason: "Intervened during receipt lookup"
-							})
-							return [
-								{
-									id: "receipt-msg-999",
-									author: { id: "bot-hermit-1", bot: true },
-									components: [{ content: `caseId=case-receipt-rev\nuser-receipt` }]
+						await reviewData.recordReviewCaseDecision(
+							"case-receipt-rev",
+							reviewConfig.guildId,
+							initialCase.cardRevision,
+							{
+							status: "dismissed",
+							expiresAt: null,
+							decidedById: "staff-quick",
+							decisionReason: "Intervened during receipt lookup"
+							}
+						)
+						return [
+							{
+								id: "receipt-msg-999",
+								channel_id: reviewConfig.reviewChannelId,
+								author: { id: "bot-hermit-1", bot: true },
+								components: [{ type: 17, components: [
+									{ type: 10, content: "### 🦞 Claw & Order | Automation Review" },
+									{ type: 10, content: "-# hermit-review:v1:case-receipt-rev" }
+								] }]
 								}
 							]
 						},
@@ -1409,13 +1495,14 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 					}
 				} as unknown as any
 
-				await postReviewEscalationCard(mockClient, initialCase, null, null)
+				await recoverReviewReceipts(mockClient)
 
 				const inDb = await reviewData.getReviewCase("case-receipt-rev")
 				expect(inDb!.deliveryStatus).toBe("delivered")
 				expect(inDb!.reviewMessageId).toBe("receipt-msg-999")
-				// Desired revision (2) was NOT overwritten by older snapshot!
-				expect(inDb!.cardRevision).toBe(2)
+				// Decision revision plus atomic receipt-adoption revision were preserved.
+				expect(inDb!.cardRevision).toBe(3)
+				expect(inDb!.syncedCardRevision).toBe(3)
 				// Reconciled and patched the staff decision onto the discovered card
 				expect(patchCalled).toBe(true)
 			} finally {
@@ -1444,11 +1531,13 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			const escalations = await reviewData.getUndeliveredEscalations(reviewConfig.guildId, 10)
 			const caseIds = escalations.map((c) => c.caseId)
 
-			// Pending must come first, followed by eligible uncertain (>60s old)
+			// New-delivery selection remains restricted to genuinely sendable work.
 			expect(caseIds[0]).toBe("case-pending-new")
-			expect(caseIds).toContain("case-unc-old")
-			// Recent uncertain (<60s backoff) is not returned, preventing starvation!
+			expect(caseIds).not.toContain("case-unc-old")
 			expect(caseIds).not.toContain("case-unc-recent")
+			const receipts = await reviewData.listOutstandingReviewReceipts(reviewConfig.guildId, 10)
+			expect(receipts.map((item) => item.caseId)).toContain("case-unc-old")
+			expect(receipts.map((item) => item.caseId)).not.toContain("case-unc-recent")
 		})
 
 		it("preserves active buttons when recovering an escalated card and closes buttons when decided", async () => {
@@ -1486,12 +1575,17 @@ describe("Claw & Order / Hermit Review Pipeline", () => {
 			expect(componentsStr).toContain("review-confirm-bot")
 
 			// Now mark the case as dismissed and bump cardRevision
-			await reviewData.recordReviewCaseDecision("case-buttons-esc", {
+			await reviewData.recordReviewCaseDecision(
+				"case-buttons-esc",
+				reviewConfig.guildId,
+				escCase.cardRevision,
+				{
 				status: "dismissed",
 				expiresAt: null,
 				decidedById: "staff-1",
 				decisionReason: "done"
-			})
+				}
+			)
 
 			const dismissedCase = (await reviewData.getReviewCase("case-buttons-esc"))!
 			await syncSharedReviewCard(mockClient, dismissedCase)

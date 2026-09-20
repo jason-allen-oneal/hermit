@@ -1,0 +1,1 @@
+ALTER TABLE `review_cases` ADD `key_signals` text DEFAULT '[]' NOT NULL;

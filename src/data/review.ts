@@ -19,6 +19,15 @@ import {
 
 const now = sql`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
+export type ReviewReceiptOwner =
+	| { kind: "delivery"; token: string }
+	| { kind: "receipt"; token: string }
+
+const receiptOwnerMatches = (owner: ReviewReceiptOwner) =>
+	owner.kind === "delivery"
+		? eq(reviewCases.deliveryClaimToken, owner.token)
+		: eq(reviewCases.receiptClaimToken, owner.token)
+
 export const recordObservation = async (
 	observation: NewReviewObservation
 ): Promise<ReviewObservation | null> => {
@@ -128,6 +137,18 @@ export const getRecentUserObservations = async (
 export const createReviewCase = async (
 	data: NewReviewCase
 ): Promise<ReviewCase | null> => {
+	const reopening = sql`(review_cases.status = 'open' OR (
+		review_cases.status = 'watchlist'
+		AND review_cases.expires_at IS NOT NULL
+		AND review_cases.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+	))`
+	const unresolvedDelivery = sql`(
+		review_cases.delivery_status IN ('uncertain', 'delivering')
+		OR (
+			review_cases.delivery_post_attempted_at IS NOT NULL
+			AND review_cases.review_message_id IS NULL
+		)
+	)`
 	const [reviewCase] = await getDb()
 		.insert(reviewCases)
 		.values(data)
@@ -139,19 +160,68 @@ export const createReviewCase = async (
 					WHEN review_cases.status = 'watchlist' AND review_cases.expires_at IS NOT NULL AND review_cases.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN ${data.status}
 					ELSE review_cases.status 
 				END`,
-				deliveryStatus: sql`CASE
-					WHEN review_cases.status = 'open' THEN ${data.deliveryStatus ?? "pending"}
-					WHEN review_cases.status = 'watchlist' AND review_cases.expires_at IS NOT NULL AND review_cases.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN 'pending'
-					ELSE review_cases.delivery_status
-				END`,
+					deliveryStatus: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_status
+						WHEN ${reopening} THEN ${data.deliveryStatus ?? "pending"}
+						ELSE review_cases.delivery_status
+					END`,
+					deliveryNonce: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_nonce
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.delivery_nonce
+					END`,
+					deliveryPreflightCompletedAt: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_preflight_completed_at
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.delivery_preflight_completed_at
+					END`,
+					deliveryPostAttemptedAt: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_post_attempted_at
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.delivery_post_attempted_at
+					END`,
+					deliveryClaimToken: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_claim_token
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.delivery_claim_token
+					END`,
+					deliveryClaimExpiresAt: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.delivery_claim_expires_at
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.delivery_claim_expires_at
+					END`,
+					receiptClaimToken: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.receipt_claim_token
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.receipt_claim_token
+					END`,
+					receiptClaimExpiresAt: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.receipt_claim_expires_at
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.receipt_claim_expires_at
+					END`,
+					receiptNextAttemptAt: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.receipt_next_attempt_at
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.receipt_next_attempt_at
+					END`,
+					receiptHistoryBefore: sql`CASE
+						WHEN ${reopening} AND ${unresolvedDelivery} THEN review_cases.receipt_history_before
+						WHEN ${reopening} THEN NULL
+						ELSE review_cases.receipt_history_before
+					END`,
 				heuristicScore: data.heuristicScore,
 				concordance: data.concordance,
 				behavioralFamilies: data.behavioralFamilies,
+				keySignals: data.keySignals,
 				evidenceMessageId: data.evidenceMessageId,
 				krillProbability: data.krillProbability,
 				krillBrief: data.krillBrief,
 				krillModel: data.krillModel,
 				reviewChannelId: data.reviewChannelId,
+				cardRevision: sql`${reviewCases.cardRevision} + 1`,
+				cardSyncNextAttemptAt: null,
+				cardSyncFailureCount: 0,
 				updatedAt: now
 			}
 		})
@@ -190,21 +260,26 @@ export const updateReviewCase = async (
 
 export const claimReviewCaseDelivery = async (
 	caseId: string,
+	guildId: string,
 	claimTimeoutMs = 120_000
 ): Promise<ReviewCase | null> => {
-	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
+	const claimExpiresAt = new Date(Date.now() + claimTimeoutMs).toISOString()
 	const [claimed] = await getDb()
 		.update(reviewCases)
 		.set({
 			previousDeliveryStatus: reviewCases.deliveryStatus,
 			deliveryStatus: "delivering",
+			deliveryNonce: sql`COALESCE(${reviewCases.deliveryNonce}, lower(hex(randomblob(12))))`,
+			deliveryClaimToken: sql`lower(hex(randomblob(16)))`,
+			deliveryClaimExpiresAt: claimExpiresAt,
 			updatedAt: now
 		})
 		.where(
 			and(
 				eq(reviewCases.caseId, caseId),
+				eq(reviewCases.guildId, guildId),
 				eq(reviewCases.status, "escalated"),
-				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed', 'uncertain') OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
+				sql`${reviewCases.deliveryStatus} IN ('pending', 'failed')`
 			)
 		)
 		.returning()
@@ -212,15 +287,126 @@ export const claimReviewCaseDelivery = async (
 	return claimed ?? null
 }
 
+export const completeReviewCaseDelivery = async (
+	caseId: string,
+	claimToken: string,
+	deliveryStatus: "delivered" | "uncertain" | "failed"
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			deliveryStatus,
+			deliveryPreflightCompletedAt: deliveryStatus === "failed" ? now : null,
+			deliveryPostAttemptedAt: null,
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			eq(reviewCases.deliveryClaimToken, claimToken)
+		))
+		.returning()
+	return updated ?? null
+}
+
+export const deferClaimedReviewDeliveryReceipt = async (
+	caseId: string,
+	claimToken: string,
+	historyBefore: string | null,
+	backoffMs = 60_000
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
+	const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString()
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			deliveryStatus: "uncertain",
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			receiptNextAttemptAt: nextAttemptAt,
+			receiptHistoryBefore: historyBefore,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			eq(reviewCases.deliveryClaimToken, claimToken)
+		))
+		.returning()
+	return updated ?? null
+}
+
+export const markReviewPostAttemptStarted = async (
+	caseId: string,
+	claimToken: string
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			deliveryPreflightCompletedAt: null,
+			deliveryPostAttemptedAt: now,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			eq(reviewCases.status, "escalated"),
+			eq(reviewCases.deliveryStatus, "delivering"),
+			eq(reviewCases.deliveryClaimToken, claimToken),
+			sql`${reviewCases.deliveryPostAttemptedAt} IS NULL`
+		))
+		.returning()
+	return updated ?? null
+}
+
+export const clearDeletedReviewReceipt = async (
+	snapshot: ReviewCase,
+	owner?: ReviewReceiptOwner
+): Promise<ReviewCase | null> => {
+	if (!snapshot.reviewMessageId || !snapshot.reviewChannelId || (owner && !owner.token)) return null
+	const ownership = owner ? [receiptOwnerMatches(owner)] : []
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			reviewMessageId: null,
+			reviewChannelId: null,
+			deliveryStatus: "failed",
+			deliveryNonce: sql`lower(hex(randomblob(12)))`,
+			deliveryPreflightCompletedAt: null,
+			deliveryPostAttemptedAt: null,
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			receiptClaimToken: null,
+			receiptClaimExpiresAt: null,
+			receiptNextAttemptAt: null,
+			receiptHistoryBefore: null,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, snapshot.caseId),
+			eq(reviewCases.guildId, snapshot.guildId),
+			eq(reviewCases.reviewMessageId, snapshot.reviewMessageId),
+			eq(reviewCases.reviewChannelId, snapshot.reviewChannelId),
+			...ownership
+		))
+		.returning()
+	return updated ?? null
+}
+
 export const recordReviewCaseDecision = async (
 	caseId: string,
+	guildId: string,
+	expectedRevision: number,
 	decision: {
 		status: "dismissed" | "watchlist" | "confirmed_bot"
 		expiresAt?: string | null
-		decidedById?: string | null
+		decidedById: string
 		decisionReason: string
 	}
 ): Promise<ReviewCase | null> => {
+	if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) return null
+	if (!guildId || !decision.decidedById) return null
 	const [updated] = await getDb()
 		.update(reviewCases)
 		.set({
@@ -229,9 +415,16 @@ export const recordReviewCaseDecision = async (
 			decidedById: decision.decidedById,
 			decisionReason: decision.decisionReason,
 			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
-		.where(eq(reviewCases.caseId, caseId))
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			eq(reviewCases.guildId, guildId),
+			eq(reviewCases.status, "escalated"),
+			eq(reviewCases.cardRevision, expectedRevision)
+		))
 		.returning()
 
 	return updated ?? null
@@ -245,6 +438,8 @@ export const markReviewCardSynced = async (
 		.update(reviewCases)
 		.set({
 			syncedCardRevision: revision,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
 		.where(
@@ -266,6 +461,8 @@ export const markReviewCardStaleWrite = async (
 		.update(reviewCases)
 		.set({
 			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
 		.where(
@@ -279,20 +476,45 @@ export const markReviewCardStaleWrite = async (
 	return updated ?? null
 }
 
-export const allocateReescalationRevision = async (
-	caseId: string
+export const deferReviewCardSync = async (
+	caseId: string,
+	backoffMs = 60_000
 ): Promise<ReviewCase | null> => {
+	const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString()
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			cardSyncNextAttemptAt: nextAttemptAt,
+			cardSyncFailureCount: sql`${reviewCases.cardSyncFailureCount} + 1`,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			sql`${reviewCases.syncedCardRevision} < ${reviewCases.cardRevision}`
+		))
+		.returning()
+	return updated ?? null
+}
+
+export const allocateReescalationRevision = async (
+	caseId: string,
+	claimToken: string
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
 	const [record] = await getDb()
 		.update(reviewCases)
 		.set({
 			cardRevision: sql`${reviewCases.cardRevision} + 1`,
 			deliveryStatus: "delivering",
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
 		.where(
 			and(
-				eq(reviewCases.caseId, caseId),
-				eq(reviewCases.status, "escalated")
+					eq(reviewCases.caseId, caseId),
+					eq(reviewCases.status, "escalated"),
+					eq(reviewCases.deliveryClaimToken, claimToken)
 			)
 		)
 		.returning()
@@ -303,10 +525,8 @@ export const allocateReescalationRevision = async (
 export const getUndeliveredEscalations = async (
 	guildId: string,
 	limit = 10,
-	claimTimeoutMs = 120_000
+	_claimTimeoutMs = 120_000
 ): Promise<ReviewCase[]> => {
-	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
-	const uncertainBackoffCutoff = new Date(Date.now() - 60_000).toISOString()
 	return getDb()
 		.select()
 		.from(reviewCases)
@@ -314,19 +534,13 @@ export const getUndeliveredEscalations = async (
 			and(
 				eq(reviewCases.guildId, guildId),
 				eq(reviewCases.status, "escalated"),
-				sql`(${reviewCases.deliveryStatus} IN ('pending', 'failed') 
-					OR (${reviewCases.deliveryStatus} = 'uncertain' AND ${reviewCases.updatedAt} <= ${uncertainBackoffCutoff})
-					OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
+				sql`${reviewCases.deliveryStatus} IN ('pending', 'failed')`
 			)
 		)
-		.orderBy(
-			sql`CASE 
-				WHEN ${reviewCases.deliveryStatus} = 'pending' THEN 0 
-				WHEN ${reviewCases.deliveryStatus} = 'failed' THEN 1 
-				ELSE 2 
-			END ASC`,
-			asc(reviewCases.updatedAt)
-		)
+			.orderBy(
+				asc(reviewCases.updatedAt),
+				asc(reviewCases.caseId)
+			)
 		.limit(limit)
 }
 
@@ -337,6 +551,9 @@ export const expireWatchlistCases = async (): Promise<number> => {
 			status: "open",
 			expiresAt: null,
 			decisionReason: "Watchlist monitoring period expired; eligible for re-evaluation.",
+			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
 		.where(
@@ -400,15 +617,27 @@ export const getUserObservationCount = async (
 	return result?.count ?? 0
 }
 
-export const listOutOfSyncCases = async (limit = 10): Promise<ReviewCase[]> => {
+export const listOutOfSyncCases = async (
+	guildId: string,
+	reviewChannelId: string,
+	limit = 10
+): Promise<ReviewCase[]> => {
+	const currentTime = new Date().toISOString()
 	return getDb()
 		.select()
 		.from(reviewCases)
-		.where(
-			and(
-				sql`review_message_id IS NOT NULL`,
-				sql`synced_card_revision < card_revision`
+			.where(
+				and(
+					eq(reviewCases.guildId, guildId),
+					eq(reviewCases.reviewChannelId, reviewChannelId),
+					sql`review_message_id IS NOT NULL`,
+				sql`synced_card_revision < card_revision`,
+				sql`(${reviewCases.cardSyncNextAttemptAt} IS NULL OR ${reviewCases.cardSyncNextAttemptAt} <= ${currentTime})`
 			)
+		)
+		.orderBy(
+			sql`COALESCE(${reviewCases.cardSyncNextAttemptAt}, ${reviewCases.updatedAt}) ASC`,
+			asc(reviewCases.caseId)
 		)
 		.limit(limit)
 }
@@ -422,37 +651,73 @@ export const listOutstandingReviewReceipts = async (
 ): Promise<ReviewCase[]> => {
 	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
 	const backoffCutoff = new Date(Date.now() - 60_000).toISOString()
+	const currentTime = new Date().toISOString()
 	return getDb()
 		.select()
 		.from(reviewCases)
 		.where(and(
 			eq(reviewCases.guildId, guildId),
-			sql`((${reviewCases.deliveryStatus} = 'uncertain' AND ${reviewCases.updatedAt} <= ${backoffCutoff})
-				OR (${reviewCases.deliveryStatus} = 'delivering' AND ${reviewCases.updatedAt} <= ${staleCutoff}))`
+			sql`((${reviewCases.deliveryStatus} = 'uncertain' AND (
+				(${reviewCases.receiptNextAttemptAt} IS NOT NULL AND ${reviewCases.receiptNextAttemptAt} <= ${currentTime})
+				OR (${reviewCases.receiptNextAttemptAt} IS NULL AND ${reviewCases.updatedAt} <= ${backoffCutoff})
+			))
+				OR (${reviewCases.deliveryStatus} = 'delivering' AND (
+					(${reviewCases.deliveryClaimExpiresAt} IS NOT NULL AND ${reviewCases.deliveryClaimExpiresAt} <= ${currentTime})
+					OR (${reviewCases.deliveryClaimExpiresAt} IS NULL AND ${reviewCases.updatedAt} <= ${staleCutoff})
+				)))`,
+			sql`(${reviewCases.receiptClaimExpiresAt} IS NULL OR ${reviewCases.receiptClaimExpiresAt} <= ${currentTime})`
 		))
-		.orderBy(asc(reviewCases.updatedAt), asc(reviewCases.caseId))
+		.orderBy(
+			sql`COALESCE(${reviewCases.receiptNextAttemptAt}, ${reviewCases.updatedAt}) ASC`,
+			asc(reviewCases.caseId)
+		)
 		.limit(limit)
 }
 
-// Compare the observed row, rather than letting a late lookup overwrite a
-// newer receipt, disposition, or retry. No exclusive lease is needed for GET.
-const receiptSnapshotMatches = (snapshot: ReviewCase) => and(
-	eq(reviewCases.caseId, snapshot.caseId),
-	eq(reviewCases.guildId, snapshot.guildId),
-	eq(reviewCases.status, snapshot.status),
-	eq(reviewCases.deliveryStatus, snapshot.deliveryStatus),
-	eq(reviewCases.cardRevision, snapshot.cardRevision),
-	eq(reviewCases.updatedAt, snapshot.updatedAt),
-	sql`${reviewCases.reviewMessageId} IS ${snapshot.reviewMessageId}`,
-	sql`${reviewCases.reviewChannelId} IS ${snapshot.reviewChannelId}`
-)
+export const claimReviewReceiptReconciliation = async (
+	caseId: string,
+	guildId: string,
+	claimToken: string,
+	claimTimeoutMs = 120_000
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
+	const staleCutoff = new Date(Date.now() - claimTimeoutMs).toISOString()
+	const backoffCutoff = new Date(Date.now() - 60_000).toISOString()
+	const currentTime = new Date().toISOString()
+	const claimExpiresAt = new Date(Date.now() + claimTimeoutMs).toISOString()
+	const [claimed] = await getDb()
+		.update(reviewCases)
+		.set({
+			receiptClaimToken: claimToken,
+			receiptClaimExpiresAt: claimExpiresAt,
+			// Receipt reconciliation takes ownership after the delivery lease expires.
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null
+		})
+		.where(and(
+			eq(reviewCases.caseId, caseId),
+			eq(reviewCases.guildId, guildId),
+			sql`((${reviewCases.deliveryStatus} = 'uncertain' AND (
+				(${reviewCases.receiptNextAttemptAt} IS NOT NULL AND ${reviewCases.receiptNextAttemptAt} <= ${currentTime})
+				OR (${reviewCases.receiptNextAttemptAt} IS NULL AND ${reviewCases.updatedAt} <= ${backoffCutoff})
+			))
+				OR (${reviewCases.deliveryStatus} = 'delivering' AND (
+					(${reviewCases.deliveryClaimExpiresAt} IS NOT NULL AND ${reviewCases.deliveryClaimExpiresAt} <= ${currentTime})
+					OR (${reviewCases.deliveryClaimExpiresAt} IS NULL AND ${reviewCases.updatedAt} <= ${staleCutoff})
+				)))`,
+			sql`(${reviewCases.receiptClaimExpiresAt} IS NULL OR ${reviewCases.receiptClaimExpiresAt} <= ${currentTime})`
+		))
+		.returning()
+	return claimed ?? null
+}
 
 export const attachReviewCaseReceipt = async (
 	snapshot: ReviewCase,
 	channelId: string,
-	messageId: string
+	messageId: string,
+	owner: ReviewReceiptOwner
 ): Promise<ReviewCase | null> => {
-	if (!channelId || !messageId ||
+	if (!owner.token || !channelId || !messageId ||
 		(snapshot.reviewMessageId && snapshot.reviewMessageId !== messageId) ||
 		(snapshot.reviewChannelId && snapshot.reviewChannelId !== channelId)) {
 		throw new Error(`Conflicting review receipt for ${snapshot.caseId}`)
@@ -463,23 +728,85 @@ export const attachReviewCaseReceipt = async (
 			reviewMessageId: messageId,
 			reviewChannelId: channelId,
 			deliveryStatus: "delivered",
+			deliveryPreflightCompletedAt: null,
+			deliveryPostAttemptedAt: null,
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			receiptClaimToken: null,
+			receiptClaimExpiresAt: null,
+			receiptNextAttemptAt: null,
+			receiptHistoryBefore: null,
 			// Receipt identity is not proof that the displayed contents are current.
 			cardRevision: sql`${reviewCases.cardRevision} + 1`,
+			cardSyncNextAttemptAt: null,
+			cardSyncFailureCount: 0,
 			updatedAt: now
 		})
-		.where(receiptSnapshotMatches(snapshot))
+		.where(and(
+			eq(reviewCases.caseId, snapshot.caseId),
+			eq(reviewCases.guildId, snapshot.guildId),
+			receiptOwnerMatches(owner),
+			sql`(${reviewCases.reviewMessageId} IS NULL OR ${reviewCases.reviewMessageId} = ${messageId})`,
+			sql`(${reviewCases.reviewChannelId} IS NULL OR ${reviewCases.reviewChannelId} = ${channelId})`
+		))
+		.returning()
+	return updated ?? null
+}
+
+export const releaseUnattemptedReviewDelivery = async (
+	snapshot: ReviewCase,
+	claimToken: string
+): Promise<ReviewCase | null> => {
+	if (!claimToken) return null
+	const [updated] = await getDb()
+		.update(reviewCases)
+		.set({
+			deliveryStatus: "failed",
+			deliveryPreflightCompletedAt: now,
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			receiptClaimToken: null,
+			receiptClaimExpiresAt: null,
+			receiptNextAttemptAt: null,
+			receiptHistoryBefore: null,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, snapshot.caseId),
+			eq(reviewCases.guildId, snapshot.guildId),
+			eq(reviewCases.receiptClaimToken, claimToken),
+			sql`${reviewCases.reviewMessageId} IS NULL`,
+			sql`${reviewCases.deliveryPostAttemptedAt} IS NULL`
+		))
 		.returning()
 	return updated ?? null
 }
 
 export const deferReviewReceiptReconciliation = async (
-	snapshot: ReviewCase
+	snapshot: ReviewCase,
+	claimToken: string,
+	historyBefore: string | null = snapshot.receiptHistoryBefore,
+	backoffMs = 60_000
 ): Promise<ReviewCase | null> => {
-	if (!["uncertain", "delivering"].includes(snapshot.deliveryStatus)) return null
+	if (!claimToken || !["uncertain", "delivering"].includes(snapshot.deliveryStatus)) return null
+	const nextAttemptAt = new Date(Date.now() + backoffMs).toISOString()
 	const [updated] = await getDb()
 		.update(reviewCases)
-		.set({ deliveryStatus: "uncertain", updatedAt: now })
-		.where(receiptSnapshotMatches(snapshot))
+		.set({
+			deliveryStatus: "uncertain",
+			deliveryClaimToken: null,
+			deliveryClaimExpiresAt: null,
+			receiptClaimToken: null,
+			receiptClaimExpiresAt: null,
+			receiptNextAttemptAt: nextAttemptAt,
+			receiptHistoryBefore: historyBefore,
+			updatedAt: now
+		})
+		.where(and(
+			eq(reviewCases.caseId, snapshot.caseId),
+			eq(reviewCases.guildId, snapshot.guildId),
+			eq(reviewCases.receiptClaimToken, claimToken)
+		))
 		.returning()
 	return updated ?? null
 }

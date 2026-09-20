@@ -15,7 +15,27 @@ import {
 	recordReviewCaseDecision
 } from "../data/review.js"
 import type { ReviewCase } from "../db/schema.js"
-import type { AnalysisReport, KrillEvaluation } from "../review/types.js"
+
+type PersistedReviewSignal = {
+	code: string
+	family: string
+	description: string
+}
+
+const parsePersistedReviewSignals = (value: string): PersistedReviewSignal[] => {
+	try {
+		const parsed = JSON.parse(value)
+		if (!Array.isArray(parsed)) return []
+		return parsed.filter((signal): signal is PersistedReviewSignal =>
+			Boolean(signal) && typeof signal === "object" &&
+			typeof signal.code === "string" &&
+			typeof signal.family === "string" &&
+			typeof signal.description === "string"
+		).slice(0, 3)
+	} catch {
+		return []
+	}
+}
 
 const hasStaffRole = (interaction: ButtonInteraction) =>
 	interaction.member?.roles.some((role) =>
@@ -24,10 +44,9 @@ const hasStaffRole = (interaction: ButtonInteraction) =>
 
 export const buildReviewCardContainer = (
 	reviewCase: ReviewCase,
-	report?: AnalysisReport | null,
-	krill?: KrillEvaluation | null,
 	closed = false
 ) => {
+	const keySignals = parsePersistedReviewSignals(reviewCase.keySignals)
 	const accentColor =
 		reviewCase.status === "confirmed_bot"
 			? "#f85149"
@@ -63,13 +82,12 @@ export const buildReviewCardContainer = (
 		)
 	}
 
-	if (report && report.signals.length > 0) {
+	if (keySignals.length > 0) {
 		lines.push(
 			new Separator({ divider: true, spacing: "small" }),
 			new TextDisplay(
 				`**Key Detected Signals:**\n` +
-					report.signals
-						.slice(0, 3)
+					keySignals
 						.map((s) => `• **${s.code}** (${s.family}): ${s.description}`)
 						.join("\n")
 			)
@@ -89,9 +107,9 @@ export const buildReviewCardContainer = (
 		lines.push(
 			new Separator({ divider: true, spacing: "small" }),
 			new Row([
-				new ReviewDismissButton(reviewCase.caseId),
-				new ReviewWatchlistButton(reviewCase.caseId),
-				new ReviewConfirmBotButton(reviewCase.caseId)
+				new ReviewDismissButton(reviewCase.caseId, reviewCase.cardRevision),
+				new ReviewWatchlistButton(reviewCase.caseId, reviewCase.cardRevision),
+				new ReviewConfirmBotButton(reviewCase.caseId, reviewCase.cardRevision)
 			])
 		)
 	}
@@ -110,17 +128,39 @@ const buildPermissionDeniedContainer = () =>
 		{ accentColor: "#f85149" }
 	)
 
+const buildChangedCaseContainer = () =>
+	new Container(
+		[
+			new TextDisplay("### Review case changed"),
+			new TextDisplay(
+				"This case has changed or is already decided.\nRun `/review` again before taking another action."
+			)
+		],
+		{ accentColor: "#d29922" }
+	)
+
+const buildReviewCustomId = (prefix: string, caseId: string, revision: number): string => {
+	if (!caseId || !Number.isSafeInteger(revision) || revision < 1) {
+		throw new TypeError("Review buttons require a case ID and positive safe revision")
+	}
+	const customId = `${prefix}:caseId=${caseId};rev=${revision}`
+	if (customId.length > 100) {
+		throw new RangeError("Review button custom ID exceeds Discord's 100-character limit")
+	}
+	return customId
+}
+
 const finishReviewDecision = async (
 	interaction: ButtonInteraction,
 	updated: ReviewCase
 ): Promise<void> => {
 	const targetsSharedCard = Boolean(updated.reviewMessageId) &&
 		interaction.message?.id === updated.reviewMessageId
-	let needsSharedSync = true
+	let needsSharedSync = Boolean(updated.reviewMessageId && updated.reviewChannelId)
 	const persistenceErrors: unknown[] = []
 	try {
 		await interaction.update({
-			components: [buildReviewCardContainer(updated, null, null, true)],
+			components: [buildReviewCardContainer(updated, true)],
 			allowedMentions: { parse: [] }
 		})
 		if (targetsSharedCard) {
@@ -154,6 +194,56 @@ const finishReviewDecision = async (
 	}
 }
 
+type ReviewDecision = {
+	status: "dismissed" | "watchlist" | "confirmed_bot"
+	expiresAt?: string | null
+	decisionReason: string
+}
+
+const applyReviewDecision = async (
+	interaction: ButtonInteraction,
+	data: ComponentData,
+	decision: ReviewDecision
+): Promise<void> => {
+	if (interaction.guild?.id !== reviewConfig.guildId || !hasStaffRole(interaction)) {
+		await interaction.reply({
+			components: [buildPermissionDeniedContainer()],
+			ephemeral: true
+		})
+		return
+	}
+
+	const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
+	const expectedRevision = typeof data?.rev === "number" &&
+		Number.isSafeInteger(data.rev) && data.rev > 0 ? data.rev : undefined
+	const actorId = interaction.user?.id || interaction.userId
+	if (!caseId || !expectedRevision || !actorId) {
+		await interaction.reply({
+			components: [buildChangedCaseContainer()],
+			ephemeral: true
+		})
+		return
+	}
+
+	const updated = await recordReviewCaseDecision(
+		caseId,
+		reviewConfig.guildId,
+		expectedRevision,
+		{
+			...decision,
+			decidedById: actorId
+		}
+	)
+	if (!updated) {
+		await interaction.reply({
+			components: [buildChangedCaseContainer()],
+			ephemeral: true
+		})
+		return
+	}
+	await finishReviewDecision(interaction, updated)
+}
+
 export class ReviewDismissButton extends Button {
 	customId = "review-dismiss"
 	label = "Dismiss (Human)"
@@ -161,33 +251,19 @@ export class ReviewDismissButton extends Button {
 	ephemeral = true
 	defer = false
 
-	constructor(caseId?: string) {
+	constructor(caseId?: string, revision?: number) {
 		super()
 		if (caseId) {
-			this.customId = `review-dismiss:caseId=${caseId}`
+			this.customId = buildReviewCustomId("review-dismiss", caseId, revision ?? 0)
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
-		if (!hasStaffRole(interaction)) {
-			await interaction.reply({
-				components: [buildPermissionDeniedContainer()],
-				ephemeral: true
-			})
-			return
-		}
-
-		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
-		if (!caseId) return
-
-		const updated = await recordReviewCaseDecision(caseId, {
+		await applyReviewDecision(interaction, data, {
 			status: "dismissed",
 			expiresAt: null,
-			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Marked as human / dismissed by staff."
 		})
-
-		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 
@@ -198,34 +274,20 @@ export class ReviewWatchlistButton extends Button {
 	ephemeral = true
 	defer = false
 
-	constructor(caseId?: string) {
+	constructor(caseId?: string, revision?: number) {
 		super()
 		if (caseId) {
-			this.customId = `review-watchlist:caseId=${caseId}`
+			this.customId = buildReviewCustomId("review-watchlist", caseId, revision ?? 0)
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
-		if (!hasStaffRole(interaction)) {
-			await interaction.reply({
-				components: [buildPermissionDeniedContainer()],
-				ephemeral: true
-			})
-			return
-		}
-
-		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
-		if (!caseId) return
-
 		const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString()
-		const updated = await recordReviewCaseDecision(caseId, {
+		await applyReviewDecision(interaction, data, {
 			status: "watchlist",
 			expiresAt,
-			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Added to watchlist for 7 days."
 		})
-
-		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 
@@ -236,33 +298,19 @@ export class ReviewConfirmBotButton extends Button {
 	ephemeral = true
 	defer = false
 
-	constructor(caseId?: string) {
+	constructor(caseId?: string, revision?: number) {
 		super()
 		if (caseId) {
-			this.customId = `review-confirm-bot:caseId=${caseId}`
+			this.customId = buildReviewCustomId("review-confirm-bot", caseId, revision ?? 0)
 		}
 	}
 
 	async run(interaction: ButtonInteraction, data: ComponentData) {
-		if (!hasStaffRole(interaction)) {
-			await interaction.reply({
-				components: [buildPermissionDeniedContainer()],
-				ephemeral: true
-			})
-			return
-		}
-
-		const caseId = typeof data?.caseId === "string" ? data.caseId : undefined
-		if (!caseId) return
-
-		const updated = await recordReviewCaseDecision(caseId, {
+		await applyReviewDecision(interaction, data, {
 			status: "confirmed_bot",
 			expiresAt: null,
-			decidedById: interaction.user?.id || interaction.userId,
 			decisionReason: "Confirmed automated agent account."
 		})
-
-		if (updated) await finishReviewDecision(interaction, updated)
 	}
 }
 

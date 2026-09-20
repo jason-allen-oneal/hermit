@@ -167,9 +167,14 @@ export default class ReviewCommand extends BaseCommand {
 				targetUserId,
 				status: targetStatus,
 				heuristicScore: report.heuristicScore ?? 0,
-				concordance: report.concordance,
-				behavioralFamilies: JSON.stringify(Object.keys(report.familyScores)),
-				evidenceMessageId: observations[0]?.messageId,
+					concordance: report.concordance,
+					behavioralFamilies: JSON.stringify(Object.keys(report.familyScores)),
+					keySignals: JSON.stringify(report.signals.slice(0, 3).map((signal) => ({
+						code: signal.code,
+						family: signal.family,
+						description: signal.description
+					}))),
+					evidenceMessageId: observations[0]?.messageId,
 				krillProbability: krill
 					? `${(krill.automationProbability * 100).toFixed(1)}%`
 					: reviewCase?.krillProbability ?? null,
@@ -219,13 +224,13 @@ export default class ReviewCommand extends BaseCommand {
 			}
 		}
 
-		if (report.priority === "review-recommended" && reviewCase) {
+		if (report.priority === "review-recommended" && reviewCase?.status === "escalated") {
 			cardSections.push(
 				new Separator({ divider: true, spacing: "small" }),
 				new Row([
-					new ReviewDismissButton(reviewCase.caseId),
-					new ReviewWatchlistButton(reviewCase.caseId),
-					new ReviewConfirmBotButton(reviewCase.caseId)
+					new ReviewDismissButton(reviewCase.caseId, reviewCase.cardRevision),
+					new ReviewWatchlistButton(reviewCase.caseId, reviewCase.cardRevision),
+					new ReviewConfirmBotButton(reviewCase.caseId, reviewCase.cardRevision)
 				])
 			)
 		}

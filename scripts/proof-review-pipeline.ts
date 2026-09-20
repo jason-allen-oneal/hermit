@@ -16,6 +16,7 @@ import {
 	markReviewCardSynced,
 	markReviewCardStaleWrite,
 	getUndeliveredEscalations,
+	listOutstandingReviewReceipts,
 	listOutOfSyncCases
 } from "../src/data/review.js"
 import {
@@ -107,6 +108,11 @@ try {
 		heuristicScore: 92,
 		concordance: "High",
 		behavioralFamilies: JSON.stringify(["operational-artifact", "stylometry", "repetition"]),
+		keySignals: JSON.stringify([{
+			code: "operational-markers",
+			family: "operational-artifact",
+			description: "Synthetic proof signal retained by the canonical renderer."
+		}]),
 		deliveryStatus: "pending"
 	})
 	assert(created)
@@ -136,12 +142,16 @@ try {
 		}
 	} as any
 
-	await postReviewEscalationCard(mockDiscord, created!, null, null)
+	await postReviewEscalationCard(mockDiscord, created!)
 	const afterPost = await getReviewCase(caseId)
 	assert.equal(afterPost?.reviewMessageId, deliveredMessageId)
 	assert.equal(afterPost?.deliveryStatus, "delivered")
+	assert(afterPost?.deliveryNonce)
+	assert.equal(afterPost?.deliveryClaimToken, null)
 	assert.equal(afterPost?.cardRevision, afterPost?.syncedCardRevision)
 	assert.equal(postCount, 1)
+	assert(JSON.stringify(lastCard).includes("Key Detected Signals"))
+	assert(JSON.stringify(lastCard).includes("operational-markers"))
 	console.log(`Delivered card through MOCKED Discord transport:`)
 	console.log(`  reviewMessageId: ${afterPost?.reviewMessageId}`)
 	console.log(`  deliveryStatus: ${afterPost?.deliveryStatus}`)
@@ -152,12 +162,17 @@ try {
 	// -------------------------------------------------------------
 	console.log("\n--- STEP 4: Staff Action & Monotonic Revision Persistence ---")
 	const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString()
-	const decided = await recordReviewCaseDecision(caseId, {
-		status: "watchlist",
-		expiresAt,
-		decidedById: "staff-operator-1",
-		decisionReason: "Observed automated timing; watchlisting 7d."
-	})
+	const decided = await recordReviewCaseDecision(
+		caseId,
+		reviewConfig.guildId,
+		afterPost!.cardRevision,
+		{
+			status: "watchlist",
+			expiresAt,
+			decidedById: "staff-operator-1",
+			decisionReason: "Observed automated timing; watchlisting 7d."
+		}
+	)
 	assert(decided)
 	assert.equal(decided.status, "watchlist")
 	assert(decided.cardRevision > decided.syncedCardRevision)
@@ -188,7 +203,11 @@ try {
 	const repaired = await markReviewCardStaleWrite(caseId, 1)
 	assert(repaired && repaired.cardRevision > repaired.syncedCardRevision)
 	console.log(`markReviewCardStaleWrite allocated repair revision: ${repaired?.cardRevision}`)
-	const outOfSync = await listOutOfSyncCases(5)
+	const outOfSync = await listOutOfSyncCases(
+		reviewConfig.guildId,
+		reviewConfig.reviewChannelId,
+		5
+	)
 	assert(outOfSync.some((item) => item.caseId === caseId))
 	await recoverSharedCardSync(mockDiscord)
 	const recovered = await getReviewCase(caseId)
@@ -209,12 +228,16 @@ try {
 
 	const escalations = await getUndeliveredEscalations(reviewConfig.guildId, 10)
 	const ids = escalations.map((e) => e.caseId)
-	console.log("Candidate recovery ordering (least-recently attempted & prioritized):")
+	console.log("New-delivery candidate ordering:")
 	ids.forEach((id, idx) => console.log(`  ${idx + 1}. ${id}`))
 	assert.equal(ids[0], "proof-pending-new")
-	assert(ids.includes("proof-unc-old"))
+	assert(!ids.includes("proof-unc-old"))
 	assert(!ids.includes("proof-unc-recent"))
-	console.log("Verified pending priority and recent-uncertainty backoff for these fixtures.")
+	const receiptCandidates = await listOutstandingReviewReceipts(reviewConfig.guildId, 10)
+	const receiptIds = receiptCandidates.map((item) => item.caseId)
+	assert(receiptIds.includes("proof-unc-old"))
+	assert(!receiptIds.includes("proof-unc-recent"))
+	console.log("Verified sendable-only delivery selection and separate uncertainty backoff.")
 
 	console.log("\nLocal D1 / mocked transport assertions passed. No live Worker, Discord, or model-provider run was performed.")
 } catch (error) {
